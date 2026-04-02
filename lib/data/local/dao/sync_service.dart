@@ -1,8 +1,10 @@
 // lib/data/local/dao/sync_service.dart
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart'; // Added for debugPrint
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../../services/database_service.dart';
 import 'connectivity_service.dart';
 
@@ -77,6 +79,7 @@ class SyncService {
   final _uuid = const Uuid();
   StreamSubscription? _connectivitySub;
   bool _isSyncing = false;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   final _eventController = StreamController<SyncEvent>.broadcast();
   Stream<SyncEvent> get events => _eventController.stream;
@@ -223,9 +226,7 @@ class SyncService {
         );
 
         try {
-          // ── Upload to server ─────────────────────────────────────────────
-          // Currently marks as synced immediately (local SQLite is source of truth).
-          // Replace _uploadToServer() body with your real API call when ready.
+          // ── Upload to Firebase Firestore ─────────────────────────────────
           final uploaded = await _uploadToServer(record);
 
           if (uploaded) {
@@ -237,7 +238,7 @@ class SyncService {
             );
             success++;
           } else {
-            await _markFailed(db, record, 'Server rejected the record');
+            await _markFailed(db, record, 'Firebase rejected the record');
             failed++;
           }
         } catch (e) {
@@ -256,31 +257,30 @@ class SyncService {
       syncedCount: success,
       pendingCount: remaining,
       message: success > 0
-          ? '$success record(s) saved ✓'
+          ? '$success record(s) saved to Firebase ✓'
           : 'Sync failed — tap Retry in queue',
     ));
 
     if (success > 0) await _cleanup(db);
   }
 
-  /// Returns true = success, false = server error.
-  /// Replace this body with a real http.post() when you have a backend.
+  /// Uploads attendance records to Firebase Firestore
   Future<bool> _uploadToServer(SyncRecord record) async {
-    // Simulate short network delay
-    await Future.delayed(const Duration(milliseconds: 200));
-
-    // ── TODO: swap with real API ──────────────────────────────────────────
-    // Example:
-    //   final res = await http.post(
-    //     Uri.parse('https://your-api.com/v1/attendance/${record.type.name}'),
-    //     headers: {'Content-Type': 'application/json'},
-    //     body: jsonEncode(record.payload),
-    //   );
-    //   return res.statusCode == 200 || res.statusCode == 201;
-    // ─────────────────────────────────────────────────────────────────────
-
-    // Data is already in local SQLite + JSON files — mark as synced locally.
-    return true;
+    try {
+      final collection = record.type == SyncType.clockIn ? 'clock_ins' : 'clock_outs';
+      
+      // Add record to Firestore
+      await _firestore.collection(collection).doc(record.id).set({
+        ...record.payload,
+        'sync_id': record.id,
+        'synced_at': FieldValue.serverTimestamp(),
+      });
+      
+      return true;
+    } catch (e) {
+      debugPrint('Firestore upload error: $e');
+      return false;
+    }
   }
 
   Future<void> _markFailed(

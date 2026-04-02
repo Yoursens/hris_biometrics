@@ -6,6 +6,9 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:intl/intl.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:excel/excel.dart';
 import '../models/employee.dart';
 import '../models/attendance.dart';
 import 'package:uuid/uuid.dart';
@@ -123,7 +126,7 @@ class DatabaseService {
   }
 
   Future<void> _seedData(Database db, String now) async {
-    for (final dept in ['Engineering','HR','Finance','Operations','Sales','Marketing']) {
+    for (final dept in ['Engineering', 'HR', 'Finance', 'Operations', 'Sales', 'Marketing']) {
       await db.insert('departments',
           {'id': dept.toLowerCase(), 'name': dept, 'created_at': now},
           conflictAlgorithm: ConflictAlgorithm.ignore);
@@ -148,9 +151,13 @@ class DatabaseService {
           try {
             if (event == 'clock_in') {
               final existing = await db.query('attendance', where: 'id = ?', whereArgs: [attendanceId]);
-              if (existing.isNotEmpty) { skipped++; continue; }
+              if (existing.isNotEmpty) {
+                skipped++;
+                continue;
+              }
 
-              final empRows = await db.query('employees', where: 'employee_id = ?', whereArgs: [record['employee_id']]);
+              final empRows = await db.query('employees',
+                  where: 'employee_id = ?', whereArgs: [record['employee_id']]);
               if (empRows.isEmpty) continue;
 
               await db.insert('attendance', {
@@ -167,23 +174,31 @@ class DatabaseService {
             } else {
               final timeOut = record['time_out'] as String?;
               if (timeOut == null) continue;
-              await db.update('attendance', {'time_out': timeOut}, where: 'id = ? AND time_out IS NULL', whereArgs: [attendanceId]);
+              await db.update('attendance', {'time_out': timeOut},
+                  where: 'id = ? AND time_out IS NULL', whereArgs: [attendanceId]);
               skipped++;
             }
-          } catch (e) { errors.add(e.toString()); }
+          } catch (e) {
+            errors.add(e.toString());
+          }
         }
       }
       if (inserted > 0) _attendanceUpdateController.add(null);
-    } catch (e) { errors.add(e.toString()); }
+    } catch (e) {
+      errors.add(e.toString());
+    }
     return SyncFromFilesResult(inserted: inserted, skipped: skipped, errors: errors);
   }
 
   Future<Directory> get localStorageRoot async {
     Directory? base;
-    try {
-      final extDirs = await getExternalStorageDirectories(type: StorageDirectory.downloads);
-      if (extDirs != null && extDirs.isNotEmpty) base = extDirs.first;
-    } catch (_) {}
+    if (Platform.isAndroid) {
+      base = Directory('/storage/emulated/0/Download');
+      if (!await base.exists()) {
+        final extDirs = await getExternalStorageDirectories(type: StorageDirectory.downloads);
+        if (extDirs != null && extDirs.isNotEmpty) base = extDirs.first;
+      }
+    }
     base ??= await getApplicationDocumentsDirectory();
     final root = Directory('${base.path}/$_rootFolder');
     if (!await root.exists()) await root.create(recursive: true);
@@ -197,9 +212,12 @@ class DatabaseService {
     return dir;
   }
 
-  Future<File> saveClockInFile({required Employee employee, required Attendance attendance}) async {
+  Future<File> saveClockInFile(
+      {required Employee employee, required Attendance attendance}) async {
     final date = attendance.date;
-    final time = (attendance.timeIn ?? DateFormat('HH:mm:ss').format(DateTime.now())).replaceAll(':', '-');
+    final time =
+    (attendance.timeIn ?? DateFormat('HH:mm:ss').format(DateTime.now()))
+        .replaceAll(':', '-');
     final attDir = await _folder('attendance', date);
     final file = File('${attDir.path}/${employee.employeeId}_clock_in_$time.json');
     await file.writeAsString(_encode({
@@ -216,7 +234,10 @@ class DatabaseService {
     return file;
   }
 
-  Future<File> saveClockOutFile({required Employee employee, required Attendance attendance, required String timeOut}) async {
+  Future<File> saveClockOutFile(
+      {required Employee employee,
+        required Attendance attendance,
+        required String timeOut}) async {
     final date = attendance.date;
     final timeTag = timeOut.replaceAll(':', '-');
     final attDir = await _folder('attendance', date);
@@ -232,197 +253,334 @@ class DatabaseService {
     return file;
   }
 
-  String _encode(Map<String, dynamic> data) => const JsonEncoder.withIndent('  ').convert(data);
+  Future<File> savePayrollExportFile(Employee employee, Map<String, dynamic> payroll) async {
+    final root = await localStorageRoot;
+    final payrollDir = Directory('${root.path}/payroll');
+    if (!await payrollDir.exists()) await payrollDir.create(recursive: true);
+    
+    // --- Generate CSV ---
+    final csvFilename = 'PAYROLL_${employee.employeeId}_${DateFormat('yyyyMMdd').format(DateTime.now())}.csv';
+    final csvFile = File('${payrollDir.path}/$csvFilename');
+    final csvBuffer = StringBuffer();
+    csvBuffer.writeln('PAYROLL REPORT (CSV)');
+    csvBuffer.writeln('Employee: ${employee.fullName}, ID: ${employee.employeeId}');
+    csvBuffer.writeln('Total Hours: ${payroll['totalHours'].toStringAsFixed(2)}, Gross: ₱${payroll['grossPay'].toStringAsFixed(2)}');
+    csvBuffer.writeln('');
+    csvBuffer.writeln('DATE,TIME IN,TIME OUT,HOURS,EARNINGS (₱)');
+    for (var r in (payroll['records'] as List)) {
+      final hrs = double.tryParse(r['hours'] ?? '0') ?? 0.0;
+      csvBuffer.writeln('${r['date']},${r['time_in']},${r['time_out']},${r['hours']},${(hrs * 150).toStringAsFixed(2)}');
+    }
+    await csvFile.writeAsString(csvBuffer.toString());
+
+    // --- Generate EXCEL ---
+    final excel = Excel.createExcel();
+    final sheet = excel['Payroll'];
+    sheet.appendRow([
+      TextCellValue('DATE'),
+      TextCellValue('TIME IN'),
+      TextCellValue('TIME OUT'),
+      TextCellValue('HOURS'),
+      TextCellValue('EARNINGS (₱)')
+    ]);
+    for (var r in (payroll['records'] as List)) {
+      final hrs = double.tryParse(r['hours'] ?? '0') ?? 0.0;
+      sheet.appendRow([
+        TextCellValue(r['date'] ?? ''),
+        TextCellValue(r['time_in'] ?? ''),
+        TextCellValue(r['time_out'] ?? ''),
+        TextCellValue(r['hours'] ?? ''),
+        TextCellValue((hrs * 150).toStringAsFixed(2))
+      ]);
+    }
+    final excelFilename = csvFilename.replaceAll('.csv', '.xlsx');
+    final excelFile = File('${payrollDir.path}/$excelFilename');
+    await excelFile.writeAsBytes(excel.save()!);
+
+    // --- Generate PDF ---
+    final pdf = pw.Document();
+    pdf.addPage(pw.Page(build: (pw.Context context) {
+      return pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+        pw.Text('PAYROLL REPORT (PDF)', style: pw.TextStyle(fontSize: 24, fontWeight: pw.FontWeight.bold)),
+        pw.SizedBox(height: 10),
+        pw.Text('Employee: ${employee.fullName} (${employee.employeeId})'),
+        pw.Text('Total Earnings: PHP ${payroll['grossPay'].toStringAsFixed(2)}'),
+        pw.SizedBox(height: 20),
+        pw.Table.fromTextArray(context: context, data: [
+          ['DATE', 'IN', 'OUT', 'HRS', 'PHP'],
+          ...((payroll['records'] as List).map((r) => [r['date'], r['time_in'], r['time_out'], r['hours'], (double.parse(r['hours'] ?? '0') * 150).toStringAsFixed(2)]))
+        ]),
+      ]);
+    }));
+    final pdfFilename = csvFilename.replaceAll('.csv', '.pdf');
+    final pdfFile = File('${payrollDir.path}/$pdfFilename');
+    await pdfFile.writeAsBytes(await pdf.save());
+
+    return csvFile; // Returning the main csv file as reference
+  }
+
+  String _encode(Map<String, dynamic> data) =>
+      const JsonEncoder.withIndent('  ').convert(data);
 
   Future<String> getLocalStoragePath() async => (await localStorageRoot).path;
 
   Future<String> getLocalStorageSize() async {
-    final root = await localStorageRoot;
-    int bytes = 0;
-    try {
-      if (await root.exists()) {
-        await for (final e in root.list(recursive: true)) if (e is File) bytes += await e.length();
-      }
-    } catch (_) {}
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1048576) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    return '${(bytes / 1048576).toStringAsFixed(1)} MB';
+  final root = await localStorageRoot;
+  int bytes = 0;
+  try {
+  if (await root.exists()) {
+  await for (final e in root.list(recursive: true)) {
+  if (e is File) bytes += await e.length();
+  }
+  }
+  } catch (_) {}
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1048576) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  return '${(bytes / 1048576).toStringAsFixed(1)} MB';
   }
 
   Future<List<String>> getLocalAttendanceDates() async {
-    final root = await localStorageRoot;
-    final dir = Directory('${root.path}/attendance');
-    if (!await dir.exists()) return [];
-    return dir.listSync().whereType<Directory>().map((d) => d.path.split('/').last).toList()..sort((a, b) => b.compareTo(a));
+  final root = await localStorageRoot;
+  final dir = Directory('${root.path}/attendance');
+  if (!await dir.exists()) return [];
+  return dir
+      .listSync()
+      .whereType<Directory>()
+      .map((d) => d.path.split('/').last)
+      .toList()
+  ..sort((a, b) => b.compareTo(a));
   }
 
   Future<List<Map<String, dynamic>>> getLocalRecordsForDate(String date) async {
-    final root = await localStorageRoot;
-    final dir = Directory('${root.path}/attendance/$date');
-    if (!await dir.exists()) return [];
-    final results = <Map<String, dynamic>>[];
-    for (final f in dir.listSync().whereType<File>()) {
-      if (f.path.endsWith('.json')) {
-        try {
-          final data = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
-          data['_file'] = f.path.split('/').last;
-          results.add(data);
-        } catch (_) {}
-      }
-    }
-    return results;
+  final root = await localStorageRoot;
+  final dir = Directory('${root.path}/attendance/$date');
+  if (!await dir.exists()) return [];
+  final results = <Map<String, dynamic>>[];
+  for (final f in dir.listSync().whereType<File>()) {
+  if (f.path.endsWith('.json')) {
+  try {
+  final data = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+  data['_file'] = f.path.split('/').last;
+  results.add(data);
+  } catch (_) {}
+  }
+  }
+  return results;
   }
 
   Future<void> clearDemoData(String demoId) async {
-    final db = await database;
-    await db.delete('attendance', where: 'employee_id = ?', whereArgs: [demoId]);
+  final db = await database;
+  await db.delete('attendance', where: 'employee_id = ?', whereArgs: [demoId]);
   }
 
   Future<String> insertEmployee(Employee employee) async {
-    final db = await database;
-    await db.insert('employees', employee.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
-    return employee.id;
+  final db = await database;
+  await db.insert('employees', employee.toMap(),
+  conflictAlgorithm: ConflictAlgorithm.replace);
+  return employee.id;
+  }
+
+  /// Updates an existing employee record in the database.
+  /// Uses the employee's [id] as the key — all fields in [toMap()] are written,
+  /// including nullable biometric fields (faceEmbedding, fingerprintHash, etc.)
+  /// which may be set to null to unenroll a biometric.
+  Future<void> updateEmployee(Employee employee) async {
+  final db = await database;
+  await db.update(
+  'employees',
+  employee.toMap(),
+  where: 'id = ?',
+  whereArgs: [employee.id],
+  );
   }
 
   Future<List<Employee>> getAllEmployees() async {
-    final db = await database;
-    final maps = await db.query('employees', where: 'is_active = ?', whereArgs: [1], orderBy: 'first_name ASC');
-    return maps.map((m) => Employee.fromMap(m)).toList();
+  final db = await database;
+  final maps = await db.query('employees',
+  where: 'is_active = ?', whereArgs: [1], orderBy: 'first_name ASC');
+  return maps.map((m) => Employee.fromMap(m)).toList();
   }
 
   Future<Employee?> getEmployeeById(String id) async {
-    final db = await database;
-    final maps = await db.query('employees', where: 'id = ?', whereArgs: [id]);
-    return maps.isNotEmpty ? Employee.fromMap(maps.first) : null;
+  final db = await database;
+  final maps = await db.query('employees', where: 'id = ?', whereArgs: [id]);
+  return maps.isNotEmpty ? Employee.fromMap(maps.first) : null;
   }
 
   Future<Employee?> getEmployeeByEmployeeId(String employeeId) async {
-    final db = await database;
-    final maps = await db.query('employees', where: 'UPPER(employee_id) = ?', whereArgs: [employeeId.toUpperCase()]);
-    return maps.isNotEmpty ? Employee.fromMap(maps.first) : null;
+  final db = await database;
+  final maps = await db.query('employees',
+  where: 'UPPER(employee_id) = ?',
+  whereArgs: [employeeId.toUpperCase()]);
+  return maps.isNotEmpty ? Employee.fromMap(maps.first) : null;
   }
 
   Future<Employee?> getEmployeeByNfcTag(String nfcTagId) async {
-    final db = await database;
-    final cleanId = nfcTagId.replaceAll(':', '').toUpperCase();
-    
-    // Search both with colons and without
-    final maps = await db.query('employees', 
-      where: 'UPPER(nfc_tag_id) = ? OR UPPER(REPLACE(nfc_tag_id, ":", "")) = ?', 
-      whereArgs: [nfcTagId.toUpperCase(), cleanId]
-    );
+  final db = await database;
+  final cleanId = nfcTagId.replaceAll(':', '').toUpperCase();
 
-    return maps.isNotEmpty ? Employee.fromMap(maps.first) : null;
+  // Search both with colons and without
+  final maps = await db.query('employees',
+  where:
+  'UPPER(nfc_tag_id) = ? OR UPPER(REPLACE(nfc_tag_id, ":", "")) = ?',
+  whereArgs: [nfcTagId.toUpperCase(), cleanId]);
+
+  return maps.isNotEmpty ? Employee.fromMap(maps.first) : null;
   }
 
   Future<void> logAttendance(Attendance attendance) async {
-    final db = await database;
-    await db.insert('attendance', attendance.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
-    _attendanceUpdateController.add(attendance.employeeId); // Notify listeners with employee ID
+  final db = await database;
+  await db.insert('attendance', attendance.toMap(),
+  conflictAlgorithm: ConflictAlgorithm.replace);
+  _attendanceUpdateController.add(attendance.employeeId);
   }
 
   Future<void> updateTimeOut(String attendanceId, String timeOut) async {
-    final db = await database;
-    // Get the employee ID before updating
-    final maps = await db.query('attendance', where: 'id = ?', whereArgs: [attendanceId]);
-    final String? empId = maps.isNotEmpty ? maps.first['employee_id'] as String? : null;
-    
-    await db.update('attendance', {'time_out': timeOut}, where: 'id = ?', whereArgs: [attendanceId]);
-    _attendanceUpdateController.add(empId); // Notify listeners
+  final db = await database;
+  // Get the employee ID before updating
+  final maps =
+  await db.query('attendance', where: 'id = ?', whereArgs: [attendanceId]);
+  final String? empId =
+  maps.isNotEmpty ? maps.first['employee_id'] as String? : null;
+
+  await db.update('attendance', {'time_out': timeOut},
+  where: 'id = ?', whereArgs: [attendanceId]);
+  _attendanceUpdateController.add(empId);
   }
 
   Future<Attendance?> getTodayAttendance(String employeeId) async {
-    final db = await database;
-    final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-    final maps = await db.query('attendance', where: 'employee_id = ? AND date = ?', whereArgs: [employeeId, today], orderBy: 'created_at DESC', limit: 1);
-    return maps.isNotEmpty ? Attendance.fromMap(maps.first) : null;
+  final db = await database;
+  final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+  final maps = await db.query('attendance',
+  where: 'employee_id = ? AND date = ?',
+  whereArgs: [employeeId, today],
+  orderBy: 'created_at DESC',
+  limit: 1);
+  return maps.isNotEmpty ? Attendance.fromMap(maps.first) : null;
   }
 
-  Future<List<Attendance>> getAttendanceByEmployee(String employeeId, {int limit = 10}) async {
-    final db = await database;
-    final maps = await db.query('attendance', where: 'employee_id = ?', whereArgs: [employeeId], orderBy: 'date DESC, created_at DESC', limit: limit);
-    return maps.map((m) => Attendance.fromMap(m)).toList();
+  Future<List<Attendance>> getAttendanceByEmployee(String employeeId,
+  {int limit = 10}) async {
+  final db = await database;
+  final maps = await db.query('attendance',
+  where: 'employee_id = ?',
+  whereArgs: [employeeId],
+  orderBy: 'date DESC, created_at DESC',
+  limit: limit);
+  return maps.map((m) => Attendance.fromMap(m)).toList();
   }
 
   Future<Map<String, int>> getAttendanceStats(String employeeId) async {
-    final db = await database;
-    final month = DateFormat('yyyy-MM').format(DateTime.now());
-    final q = (String s) => db.rawQuery("SELECT COUNT(*) FROM attendance WHERE employee_id=? AND date LIKE ? AND status=?", [employeeId, '$month%', s]);
-    return {'present': Sqflite.firstIntValue(await q('present')) ?? 0, 'late': Sqflite.firstIntValue(await q('late')) ?? 0, 'absent': Sqflite.firstIntValue(await q('absent')) ?? 0};
+  final db = await database;
+  final month = DateFormat('yyyy-MM').format(DateTime.now());
+  final q = (String s) => db.rawQuery(
+  "SELECT COUNT(*) FROM attendance WHERE employee_id=? AND date LIKE ? AND status=?",
+  [employeeId, '$month%', s]);
+  return {
+  'present': Sqflite.firstIntValue(await q('present')) ?? 0,
+  'late': Sqflite.firstIntValue(await q('late')) ?? 0,
+  'absent': Sqflite.firstIntValue(await q('absent')) ?? 0,
+  };
   }
 
   Future<List<Map<String, dynamic>>> getWeeklyWorkHours(String employeeId) async {
-    final db = await database;
-    final now = DateTime.now();
-    final startOfWeek = now.subtract(Duration(days: now.weekday - 1));
-    final results = <Map<String, dynamic>>[];
-    for (int i = 0; i < 7; i++) {
-      final dateStr = DateFormat('yyyy-MM-dd').format(startOfWeek.add(Duration(days: i)));
-      final maps = await db.query('attendance', where: 'employee_id = ? AND date = ?', whereArgs: [employeeId, dateStr]);
-      double hours = 0;
-      for (var m in maps) {
-        try {
-          final att = Attendance.fromMap(m);
-          if (att.timeIn != null && att.timeOut != null) {
-            final s = DateTime.parse('${att.date} ${att.timeIn}');
-            final e = DateTime.parse('${att.date} ${att.timeOut}');
-            hours += e.difference(s).inMinutes / 60.0;
-          }
-        } catch (_) {}
-      }
-      results.add({'day': i, 'hours': hours});
-    }
-    return results;
+  final db = await database;
+  final now = DateTime.now();
+  final startOfWeek = now.subtract(Duration(days: now.weekday - 1));
+  final results = <Map<String, dynamic>>[];
+  for (int i = 0; i < 7; i++) {
+  final dateStr =
+  DateFormat('yyyy-MM-dd').format(startOfWeek.add(Duration(days: i)));
+  final maps = await db.query('attendance',
+  where: 'employee_id = ? AND date = ?',
+  whereArgs: [employeeId, dateStr]);
+  double hours = 0;
+  for (var m in maps) {
+  try {
+  final att = Attendance.fromMap(m);
+  if (att.timeIn != null && att.timeOut != null) {
+  final s = DateTime.parse('${att.date} ${att.timeIn}');
+  final e = DateTime.parse('${att.date} ${att.timeOut}');
+  hours += e.difference(s).inMinutes / 60.0;
+  }
+  } catch (_) {}
+  }
+  results.add({'day': i, 'hours': hours});
+  }
+  return results;
   }
 
-  Future<Map<String, dynamic>> getPayrollSummary(String employeeId, {int days = 15}) async {
-    final db = await database;
-    final now = DateTime.now();
-    final cutoffStr = DateFormat('yyyy-MM-dd').format(now.subtract(Duration(days: days)));
-    final maps = await db.query('attendance', where: 'employee_id = ? AND date >= ?', whereArgs: [employeeId, cutoffStr], orderBy: 'date ASC');
-    
-    double totalHours = 0;
-    int daysPresent = 0;
-    final records = <Map<String, dynamic>>[];
+  Future<Map<String, dynamic>> getPayrollSummary(String employeeId,
+  {int days = 15}) async {
+  final db = await database;
+  final now = DateTime.now();
+  final cutoffStr =
+  DateFormat('yyyy-MM-dd').format(now.subtract(Duration(days: days)));
+  final maps = await db.query('attendance',
+  where: 'employee_id = ? AND date >= ?',
+  whereArgs: [employeeId, cutoffStr],
+  orderBy: 'date ASC');
 
-    for (var m in maps) {
-      final att = Attendance.fromMap(m);
-      if (att.timeIn != null && att.timeOut != null) {
-        final s = DateTime.parse('${att.date} ${att.timeIn}');
-        final e = DateTime.parse('${att.date} ${att.timeOut}');
-        final h = e.difference(s).inMinutes / 60.0;
-        totalHours += h;
-        daysPresent++;
-        records.add({
-          'date': att.date, 'time_in': att.timeIn, 'time_out': att.timeOut, 'hours': h.toStringAsFixed(2), 'status': att.status.name,
-        });
-      }
-    }
-    return {
-      'totalHours': totalHours, 'daysPresent': daysPresent, 'grossPay': totalHours * 150.0,
-      'cutoff': 'Cutoff: ${DateFormat('MMM dd').format(now.subtract(Duration(days: days)))} - ${DateFormat('MMM dd').format(now)}',
-      'rate': 150.0, 'records': records,
-    };
+  double totalHours = 0;
+  int daysPresent = 0;
+  final records = <Map<String, dynamic>>[];
+
+  for (var m in maps) {
+  final att = Attendance.fromMap(m);
+  if (att.timeIn != null && att.timeOut != null) {
+    try {
+      final s = DateTime.parse('${att.date} ${att.timeIn}');
+      final e = DateTime.parse('${att.date} ${att.timeOut}');
+      final diff = e.difference(s);
+      final h = diff.inMinutes / 60.0;
+      totalHours += h;
+      daysPresent++;
+      records.add({
+        'date': att.date,
+        'time_in': att.timeIn,
+        'time_out': att.timeOut,
+        'hours': h.toStringAsFixed(2),
+        'status': att.status.name,
+      });
+    } catch (_) {}
+  }
+  }
+  return {
+  'totalHours': totalHours,
+  'daysPresent': daysPresent,
+  'grossPay': totalHours * 150.0,
+  'cutoff':
+  'Cutoff: ${DateFormat('MMM dd').format(now.subtract(Duration(days: days)))} - ${DateFormat('MMM dd').format(now)}',
+  'rate': 150.0,
+  'records': records,
+  };
   }
 
   Future<void> insertAuditLog(Map<String, dynamic> log) async {
-    final db = await database;
-    await db.insert('audit_logs', log, conflictAlgorithm: ConflictAlgorithm.replace);
+  final db = await database;
+  await db.insert('audit_logs', log,
+  conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<void> insertLeaveRequest(Map<String, dynamic> leave) async {
-    final db = await database;
-    await db.insert('leave_requests', {'id': const Uuid().v4(), ...leave, 'status': 'pending', 'created_at': DateTime.now().toIso8601String()});
+  final db = await database;
+  await db.insert('leave_requests', {
+  'id': const Uuid().v4(),
+  ...leave,
+  'status': 'pending',
+  'created_at': DateTime.now().toIso8601String(),
+  });
   }
 
   void dispose() {
-    _attendanceUpdateController.close();
+  _attendanceUpdateController.close();
   }
 }
 
 class SyncFromFilesResult {
   final int inserted, skipped;
   final List<String> errors;
-  SyncFromFilesResult({required this.inserted, required this.skipped, required this.errors});
+  SyncFromFilesResult(
+      {required this.inserted, required this.skipped, required this.errors});
   bool get hasChanges => inserted > 0;
 }

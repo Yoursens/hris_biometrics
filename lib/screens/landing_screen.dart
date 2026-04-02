@@ -3,7 +3,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../theme/app_theme.dart';
+import '../services/database_service.dart';
+import '../services/security_service.dart';
 import 'login_screen.dart';
+import 'main_screen.dart';
 
 class LandingScreen extends StatefulWidget {
   const LandingScreen({super.key});
@@ -93,6 +96,30 @@ class _LandingScreenState extends State<LandingScreen>
         timer.cancel();
       }
     });
+
+    // Verify if user should be redirected
+    _checkAuthStatus();
+  }
+
+  Future<void> _checkAuthStatus() async {
+    // 1. Check if session is still valid (auto-login)
+    final isValid = await SecurityService.instance.isSessionValid();
+    if (isValid) {
+      final employeeId = await SecurityService.instance.getCurrentEmployeeId();
+      if (employeeId != null && mounted) {
+        Navigator.pushReplacement(
+          context, MaterialPageRoute(builder: (_) => const MainScreen()));
+        return;
+      }
+    }
+
+    // 2. Check if any account exists in the database
+    final employees = await DatabaseService.instance.getAllEmployees();
+    if (employees.isNotEmpty && mounted) {
+      // Direct to login if accounts exist
+      Navigator.pushReplacement(
+        context, MaterialPageRoute(builder: (_) => const LoginScreen()));
+    }
   }
 
   @override

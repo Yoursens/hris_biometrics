@@ -1,488 +1,658 @@
 // lib/screens/signup_screen.dart
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:nfc_manager/nfc_manager.dart';
 import 'package:uuid/uuid.dart';
+import 'package:local_auth/local_auth.dart';
+import 'package:intl/intl.dart';
+import 'package:camera/camera.dart';
 import '../theme/app_theme.dart';
 import '../services/security_service.dart';
 import '../services/database_service.dart';
+import '../services/auth_service.dart';
 import '../models/employee.dart';
 import 'login_screen.dart';
 
 class SignupScreen extends StatefulWidget {
-  /// If coming from LoginScreen after an unknown NFC tap, this is pre-filled
-  final String? prefilledNfcTag;
-
-  const SignupScreen({super.key, this.prefilledNfcTag});
+  const SignupScreen({super.key});
 
   @override
   State<SignupScreen> createState() => _SignupScreenState();
 }
 
 class _SignupScreenState extends State<SignupScreen> {
-  final _formKey = GlobalKey<FormState>();
-  final _nameController     = TextEditingController();
-  final _emailController    = TextEditingController();
-  final _empIdController    = TextEditingController();
-  final _roleController     = TextEditingController();
-  final _passwordController = TextEditingController();
+  final PageController _pageController = PageController();
+  int _currentStep = 0;
 
-  bool    _isLoading      = false;
-  bool    _nfcAvailable   = false;
-  bool    _nfcScanning    = false;
-  String? _scannedNfcTag;   // stores the hex tag ID
+  // Step 1: Form Data
+  final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _empIdController = TextEditingController();
+  final _roleController = TextEditingController();
+  final _pinController = TextEditingController();
+
+  // Step 2: Fingerprint
+  bool? _hasFingerprintChoice; // true = Yes, false = No
+  bool _fingerprintDone = false;
+  final LocalAuthentication _localAuth = LocalAuthentication();
+
+  // Step 3: Face ID
+  bool _faceIdDone = false;
+  DateTime? _faceIdTimestamp;
+  CameraController? _cameraController;
+  bool _isCameraReady = false;
+
+  // Step 4: NFC
+  bool _nfcSupported = false;
+  bool? _hasNfcChoice; // true = Yes, false = No
+  String? _scannedNfcTag;
+  bool _nfcScanning = false;
+
+  bool _isRegistering = false;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    // Pre-fill NFC tag if passed from LoginScreen
-    if (widget.prefilledNfcTag != null) {
-      _scannedNfcTag = widget.prefilledNfcTag;
-    }
-    _checkNfc();
+    _checkNfcHardware();
   }
 
-  Future<void> _checkNfc() async {
-    final available = await NfcManager.instance.isAvailable();
-    if (mounted) setState(() => _nfcAvailable = available);
+  @override
+  void dispose() {
+    _cameraController?.dispose();
+    _nameController.dispose();
+    _emailController.dispose();
+    _empIdController.dispose();
+    _roleController.dispose();
+    _pinController.dispose();
+    _pageController.dispose();
+    super.dispose();
   }
 
-  // ─── NFC Scan for registration ────────────────────────────────────────────
-  Future<void> _scanNfcTag() async {
-    if (!_nfcAvailable || _nfcScanning) return;
-    setState(() {
-      _nfcScanning = true;
-      _scannedNfcTag = null;
-      _error = null;
-    });
+  Future<void> _checkNfcHardware() async {
+    try {
+      bool isAvailable = await NfcManager.instance.isAvailable();
+      if (mounted) setState(() => _nfcSupported = isAvailable);
+    } catch (_) {}
+  }
+
+  Future<void> _initCamera() async {
+    final cameras = await availableCameras();
+    if (cameras.isEmpty) return;
+
+    final frontCamera = cameras.firstWhere(
+      (camera) => camera.lensDirection == CameraLensDirection.front,
+      orElse: () => cameras.first,
+    );
+
+    _cameraController = CameraController(
+      frontCamera,
+      ResolutionPreset.medium,
+      enableAudio: false,
+    );
 
     try {
-      await NfcManager.instance.stopSession();
+      await _cameraController!.initialize();
+      if (mounted) setState(() => _isCameraReady = true);
+    } catch (e) {
+      debugPrint('Camera error: $e');
+    }
+  }
 
-      NfcManager.instance.startSession(
-        pollingOptions: {
-          NfcPollingOption.iso14443,
-          NfcPollingOption.iso15693,
-        },
-        onDiscovered: (NfcTag tag) async {
-          final tagId = _extractTagId(tag);
-          await NfcManager.instance.stopSession();
+  void _nextPage() {
+    if (_currentStep < 4) {
+      if (_currentStep == 1) { // Moving from Fingerprint to Face ID
+        _initCamera();
+      }
+      _pageController.nextPage(
+          duration: const Duration(milliseconds: 400), curve: Curves.easeInOut);
+      setState(() => _currentStep++);
+    }
+  }
 
-          if (tagId == null) {
-            if (mounted) {
-              setState(() {
-                _error = 'Could not read tag ID. Try again.';
-                _nfcScanning = false;
-              });
-            }
-            return;
-          }
+  void _prevPage() {
+    if (_currentStep > 0) {
+      if (_currentStep == 2) { // Leaving Face ID step
+        _cameraController?.dispose();
+        _isCameraReady = false;
+      }
+      _pageController.previousPage(
+          duration: const Duration(milliseconds: 400), curve: Curves.easeInOut);
+      setState(() => _currentStep--);
+    }
+  }
 
-          // Check if tag is already registered to another employee
-          final existing =
-          await DatabaseService.instance.getEmployeeByNfcTag(tagId);
-
-          if (mounted) {
-            if (existing != null) {
-              setState(() {
-                _error =
-                'This keyfob is already registered to ${existing.fullName}.';
-                _nfcScanning = false;
-              });
-            } else {
-              setState(() {
-                _scannedNfcTag = tagId;
-                _nfcScanning   = false;
-              });
-              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                content: Text('Keyfob registered: $tagId'),
-                backgroundColor: AppColors.success,
-                duration: const Duration(seconds: 2),
-              ));
-            }
-          }
-        },
+  // --- Step 2: Fingerprint Enrollment ---
+  Future<void> _enrollFingerprint() async {
+    try {
+      bool authenticated = await _localAuth.authenticate(
+        localizedReason: 'Scan your fingerprint to link it to your account',
+        options: const AuthenticationOptions(biometricOnly: true, stickyAuth: true),
       );
+      if (authenticated && mounted) {
+        setState(() => _fingerprintDone = true);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('✓ Fingerprint Linked'), backgroundColor: AppColors.success),
+        );
+      }
+    } catch (e) {
+      debugPrint('Fingerprint error: $e');
+    }
+  }
 
-      // Auto-timeout after 20 s
-      Future.delayed(const Duration(seconds: 20), () {
-        if (mounted && _nfcScanning) {
-          NfcManager.instance.stopSession();
+  // --- Step 3: Face ID Enrollment ---
+  Future<void> _enrollFaceId() async {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+
+    try {
+      await _cameraController!.takePicture();
+      setState(() {
+        _faceIdDone = true;
+        _faceIdTimestamp = DateTime.now();
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('✓ Facial Recognition Captured'), backgroundColor: AppColors.success),
+      );
+    } catch (e) {
+      debugPrint('Take picture error: $e');
+    }
+  }
+
+  // --- Step 4: NFC Logic ---
+  Future<void> _scanNfc() async {
+    if (_nfcScanning) return;
+    setState(() { _nfcScanning = true; _scannedNfcTag = null; });
+
+    try {
+      NfcManager.instance.startSession(onDiscovered: (NfcTag tag) async {
+        final tagId = _extractTagId(tag);
+        await NfcManager.instance.stopSession();
+        if (mounted) {
           setState(() {
+            _scannedNfcTag = tagId;
             _nfcScanning = false;
-            _error ??= 'NFC scan timed out. Tap the button to try again.';
           });
         }
       });
     } catch (e) {
-      if (mounted) {
-        setState(() {
-          _error = 'NFC error: $e';
-          _nfcScanning = false;
-        });
-      }
+      if (mounted) setState(() => _nfcScanning = false);
     }
   }
 
   String? _extractTagId(NfcTag tag) {
     try {
-      final tagMap = tag.data as Map<String, dynamic>;
-      List<int>? tryKey(String k) {
-        final tech = tagMap[k] as Map<dynamic, dynamic>?;
-        if (tech == null) return null;
-        final raw = tech['identifier'];
-        return raw is List ? raw.cast<int>() : null;
+      final tagMap = tag.data as Map;
+      for (final value in tagMap.values) {
+        if (value is Map && value.containsKey('identifier')) {
+          final id = value['identifier'] as List<int>;
+          return id.map((b) => b.toRadixString(16).padLeft(2, '0')).join(':').toUpperCase();
+        }
       }
-
-      final id = tryKey('nfca') ??
-          tryKey('nfcb') ??
-          tryKey('nfcf') ??
-          tryKey('nfcv') ??
-          tryKey('isodep') ??
-          tryKey('mifare-classic') ??
-          tryKey('mifare-ultralight');
-
-      if (id == null || id.isEmpty) return null;
-      return id
-          .map((e) => e.toRadixString(16).padLeft(2, '0'))
-          .join(':')
-          .toUpperCase();
-    } catch (_) {
-      return null;
-    }
+    } catch (_) {}
+    return null;
   }
 
-  // ─── Register ─────────────────────────────────────────────────────────────
-  Future<void> _handleSignup() async {
-    if (!_formKey.currentState!.validate()) return;
-
-    setState(() { _isLoading = true; _error = null; });
-
+  // --- FINAL: Complete Registration ---
+  Future<void> _handleFinalRegister() async {
+    setState(() { _isRegistering = true; _error = null; });
     try {
-      final fullName  = _nameController.text.trim();
-      final names     = fullName.split(' ');
+      final fullName = _nameController.text.trim();
+      final names = fullName.split(' ');
       final firstName = names.isNotEmpty ? names[0] : '';
-      final lastName  = names.length > 1 ? names.sublist(1).join(' ') : 'User';
-      final empId     = _empIdController.text.trim().toUpperCase();
-
-      // Check duplicate employee ID
-      final existing =
-      await DatabaseService.instance.getEmployeeByEmployeeId(empId);
-      if (existing != null) throw 'Employee ID "$empId" is already registered.';
-
-      // Hash PIN
-      final salt         = SecurityService.instance.generateSalt();
-      final passwordHash = SecurityService.instance
-          .hashPin(_passwordController.text.trim(), salt);
+      final lastName = names.length > 1 ? names.sublist(1).join(' ') : 'User';
+      
+      final salt = SecurityService.instance.generateSalt();
+      final pinHash = SecurityService.instance.hashPin(_pinController.text.trim(), salt);
 
       final employee = Employee(
-        id:           const Uuid().v4(),
-        employeeId:   empId,
-        firstName:    firstName,
-        lastName:     lastName,
-        email:        _emailController.text.trim().toLowerCase(),
-        department:   'Corporate',
-        position:     _roleController.text.trim(),
-        pinHash:      passwordHash,
-        pinSalt:      salt,
-        nfcTagId:     _scannedNfcTag,   // ← attach scanned tag (nullable)
-        createdAt:    DateTime.now(),
-        updatedAt:    DateTime.now(),
+        id: const Uuid().v4(),
+        employeeId: _empIdController.text.trim().toUpperCase(),
+        firstName: firstName,
+        lastName: lastName,
+        email: _emailController.text.trim().toLowerCase(),
+        department: 'Corporate',
+        position: _roleController.text.trim(),
+        pinHash: pinHash,
+        pinSalt: salt,
+        nfcTagId: _scannedNfcTag,
+        faceEmbedding: _faceIdDone ? 'enrolled_data' : null,
+        fingerprintHash: _fingerprintDone ? 'enrolled_data' : null,
+        createdAt: DateTime.now(),
+        updatedAt: DateTime.now(),
       );
 
-      await DatabaseService.instance.insertEmployee(employee);
+      await AuthService.instance.registerEmployee(
+        email: employee.email,
+        password: _pinController.text.trim().padRight(6, '0'),
+        employee: employee,
+      );
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text('Registration successful! Please login.'),
+        content: Text('Registration successful!'),
         backgroundColor: AppColors.success,
       ));
-      Navigator.pushReplacement(
-          context, MaterialPageRoute(builder: (_) => const LoginScreen()));
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginScreen()));
     } catch (e) {
-      setState(() { _error = e.toString(); _isLoading = false; });
+      setState(() { _error = e.toString(); _isRegistering = false; });
     }
   }
 
-  @override
-  void dispose() {
-    _nameController.dispose();
-    _emailController.dispose();
-    _empIdController.dispose();
-    _roleController.dispose();
-    _passwordController.dispose();
-    try { NfcManager.instance.stopSession(); } catch (_) {}
-    super.dispose();
-  }
-
-  // ─── Build ────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: Container(
         decoration: const BoxDecoration(gradient: AppColors.gradientDark),
         child: SafeArea(
-          child: Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: Form(
-                key: _formKey,
-                child: Column(
+          child: Column(
+            children: [
+              _buildProgressHeader(),
+              Expanded(
+                child: PageView(
+                  controller: _pageController,
+                  physics: const NeverScrollableScrollPhysics(),
                   children: [
-                    const SizedBox(height: 20),
-                    _buildHeader(),
-                    const SizedBox(height: 32),
-                    _buildTextField(_nameController,  'Full Name',           Icons.person_outline),
-                    const SizedBox(height: 16),
-                    _buildTextField(_emailController, 'Email Address',       Icons.email_outlined,
-                        keyboardType: TextInputType.emailAddress),
-                    const SizedBox(height: 16),
-                    _buildTextField(_empIdController, 'Employee ID',         Icons.badge_outlined,
-                        textCapitalization: TextCapitalization.characters),
-                    const SizedBox(height: 16),
-                    _buildTextField(_roleController,  'Role in Company',     Icons.work_outline),
-                    const SizedBox(height: 16),
-                    _buildTextField(_passwordController, 'Password (4-digit PIN)',
-                        Icons.lock_outline,
-                        keyboardType: TextInputType.number,
-                        obscureText: true,
-                        maxLength: 4),
-                    const SizedBox(height: 20),
-
-                    // ── NFC keyfob section ─────────────────────────────────
-                    if (_nfcAvailable) _buildNfcSection(),
-
-                    const SizedBox(height: 24),
-                    if (_error != null) _buildError(),
-                    _buildSignupButton(),
-                    const SizedBox(height: 16),
-                    _buildLoginLink(),
-                    const SizedBox(height: 20),
+                    _buildStep1Form(),
+                    _buildStep2Fingerprint(),
+                    _buildStep3FaceId(),
+                    _buildStep4Nfc(),
+                    _buildStep5Summary(),
                   ],
                 ),
               ),
-            ),
+            ],
           ),
         ),
       ),
     );
   }
 
-  Widget _buildHeader() {
-    return Column(children: [
-      Container(
-        width: 64, height: 60,
-        decoration: BoxDecoration(
-          gradient: AppColors.gradientPrimary,
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: const Icon(Icons.person_add_rounded,
-            color: AppColors.primary, size: 30),
-      ),
-      const SizedBox(height: 16),
-      const Text('Create Account',
-          style: TextStyle(
-              fontSize: 26,
-              fontWeight: FontWeight.w800,
-              color: AppColors.textPrimary,
-              letterSpacing: -0.5)),
-      const SizedBox(height: 8),
-      const Text('Enter your details to register',
-          style: TextStyle(fontSize: 14, color: AppColors.textSecondary)),
-    ]);
-  }
-
-  // ── NFC keyfob card ────────────────────────────────────────────────────────
-  Widget _buildNfcSection() {
-    final hasTag = _scannedNfcTag != null;
+  Widget _buildProgressHeader() {
     return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppColors.card,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: hasTag
-              ? AppColors.success.withValues(alpha: 0.5)
-              : AppColors.cardBorder,
-        ),
-      ),
+      padding: const EdgeInsets.all(24),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(children: [
-            Icon(
-              hasTag
-                  ? Icons.contactless_rounded
-                  : Icons.nfc_rounded,
-              color: hasTag ? AppColors.success : AppColors.textMuted,
-              size: 20,
-            ),
-            const SizedBox(width: 8),
-            Text(
-              hasTag ? 'Keyfob Linked ✓' : 'Link NFC Keyfob (Optional)',
-              style: TextStyle(
-                color: hasTag ? AppColors.success : AppColors.textSecondary,
-                fontWeight: FontWeight.w700,
-                fontSize: 14,
-              ),
-            ),
-          ]),
-          const SizedBox(height: 8),
-          if (hasTag) ...[
-            Container(
-              padding: const EdgeInsets.symmetric(
-                  horizontal: 12, vertical: 8),
-              decoration: BoxDecoration(
-                color: AppColors.success.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Row(children: [
-                const Icon(Icons.check_circle_rounded,
-                    color: AppColors.success, size: 14),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    _scannedNfcTag!,
-                    style: const TextStyle(
-                        color: AppColors.success,
-                        fontSize: 12,
-                        fontFamily: 'monospace'),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: List.generate(5, (i) {
+              bool active = i <= _currentStep;
+              return Expanded(
+                child: Container(
+                  height: 4,
+                  margin: const EdgeInsets.symmetric(horizontal: 2),
+                  decoration: BoxDecoration(
+                    color: active ? AppColors.accent : Colors.white24,
+                    borderRadius: BorderRadius.circular(2),
                   ),
                 ),
-                GestureDetector(
-                  onTap: () =>
-                      setState(() => _scannedNfcTag = null),
-                  child: const Icon(Icons.close_rounded,
-                      color: AppColors.textMuted, size: 16),
-                ),
-              ]),
-            ),
-            const SizedBox(height: 8),
-          ] else
-            const Text(
-              'Tap your keyfob to link it to this account.',
-              style: TextStyle(
-                  color: AppColors.textMuted,
-                  fontSize: 12,
-                  height: 1.4),
-            ),
+              );
+            }),
+          ),
           const SizedBox(height: 12),
-          SizedBox(
-            width: double.infinity,
-            height: 44,
-            child: ElevatedButton.icon(
-              onPressed: _nfcScanning ? null : _scanNfcTag,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: hasTag
-                    ? AppColors.success.withValues(alpha: 0.12)
-                    : AppColors.accent.withValues(alpha: 0.12),
-                foregroundColor:
-                hasTag ? AppColors.success : AppColors.accent,
-                elevation: 0,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  side: BorderSide(
-                    color: hasTag ? AppColors.success : AppColors.accent,
-                    width: 1.2,
-                  ),
-                ),
-              ),
-              icon: _nfcScanning
-                  ? const SizedBox(
-                  width: 16, height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2))
-                  : Icon(hasTag
-                  ? Icons.refresh_rounded
-                  : Icons.contactless_rounded,
-                  size: 18),
-              label: Text(
-                _nfcScanning
-                    ? 'Waiting for keyfob...'
-                    : hasTag
-                    ? 'Scan Different Keyfob'
-                    : 'Scan Keyfob Now',
-                style: const TextStyle(
-                    fontWeight: FontWeight.w700, fontSize: 13),
-              ),
-            ),
+          Text(
+            ['Account Info', 'Biometrics', 'Recognition', 'Keyfob', 'Review'][_currentStep],
+            style: const TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, fontSize: 12),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildTextField(
-      TextEditingController controller,
-      String label,
-      IconData icon, {
-        TextInputType? keyboardType,
-        TextCapitalization textCapitalization = TextCapitalization.none,
-        bool obscureText = false,
-        int? maxLength,
-      }) {
+  Widget _buildStep1Form() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      child: Form(
+        key: _formKey,
+        child: Column(
+          children: [
+            const _StepHeader(title: 'Create Profile', subtitle: 'Enter your employment details'),
+            const SizedBox(height: 32),
+            _buildField(_nameController, 'Full Name', Icons.person_outline),
+            const SizedBox(height: 16),
+            _buildField(_empIdController, 'Employee ID', Icons.badge_outlined),
+            const SizedBox(height: 16),
+            _buildField(_emailController, 'Email Address', Icons.email_outlined, keyboardType: TextInputType.emailAddress),
+            const SizedBox(height: 16),
+            _buildField(_roleController, 'Role in Company', Icons.work_outline),
+            const SizedBox(height: 16),
+            _buildField(_pinController, '4-Digit PIN', Icons.lock_outline, maxLength: 4, keyboardType: TextInputType.number, obscureText: true),
+            const SizedBox(height: 40),
+            _buildNextButton(onPressed: () {
+              if (_formKey.currentState!.validate()) _nextPage();
+            }),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStep2Fingerprint() {
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        children: [
+          const _StepHeader(title: 'Fingerprint', subtitle: 'Secure your account with biometrics'),
+          const Spacer(),
+          if (_hasFingerprintChoice == null) ...[
+            const Icon(Icons.fingerprint_rounded, size: 80, color: Colors.white24),
+            const SizedBox(height: 40),
+            const Text('Do you want to use fingerprint login?', style: TextStyle(color: Colors.white70)),
+            const SizedBox(height: 24),
+            Row(
+              children: [
+                Expanded(child: _buildChoiceButton('YES', true, Icons.check_circle_outline, isFingerprint: true)),
+                const SizedBox(width: 16),
+                Expanded(child: _buildChoiceButton('NO', false, Icons.cancel_outlined, isFingerprint: true)),
+              ],
+            ),
+          ] else if (_hasFingerprintChoice == true) ...[
+            GestureDetector(
+              onTap: _enrollFingerprint,
+              child: Container(
+                width: 150, height: 150,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _fingerprintDone ? AppColors.success.withOpacity(0.1) : AppColors.accent.withOpacity(0.1),
+                  border: Border.all(color: _fingerprintDone ? AppColors.success : AppColors.accent, width: 2),
+                ),
+                child: Icon(
+                  _fingerprintDone ? Icons.check_rounded : Icons.fingerprint_rounded,
+                  size: 80,
+                  color: _fingerprintDone ? AppColors.success : AppColors.accent,
+                ),
+              ),
+            ),
+            const SizedBox(height: 24),
+            Text(
+              _fingerprintDone ? 'Fingerprint Linked Successfully' : 'Tap to scan your fingerprint',
+              style: TextStyle(color: _fingerprintDone ? AppColors.success : Colors.white70),
+            ),
+            if (!_fingerprintDone)
+              TextButton(onPressed: () => setState(() => _hasFingerprintChoice = false), child: const Text('Skip this step', style: TextStyle(color: Colors.white38))),
+          ] else ...[
+            const Icon(Icons.block_rounded, size: 80, color: Colors.white24),
+            const SizedBox(height: 24),
+            const Text('Fingerprint Scanning Skipped', style: TextStyle(color: Colors.white70)),
+            TextButton(onPressed: () => setState(() => _hasFingerprintChoice = null), child: const Text('Change Choice', style: TextStyle(color: AppColors.accent))),
+          ],
+          const Spacer(),
+          if (_fingerprintDone) ...[
+            _buildReviewBox([
+              _ReviewRow(label: 'Name', value: _nameController.text),
+              _ReviewRow(label: 'ID', value: _empIdController.text),
+              _ReviewRow(label: 'Role', value: _roleController.text),
+            ]),
+            const SizedBox(height: 24),
+          ],
+          Row(
+            children: [
+              Expanded(child: _buildBackButton()),
+              const SizedBox(width: 16),
+              Expanded(child: _buildNextButton(onPressed: (_hasFingerprintChoice == false || _fingerprintDone) ? _nextPage : null)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStep3FaceId() {
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        children: [
+          const _StepHeader(title: 'Facial Recognition', subtitle: 'Position your face in the center'),
+          const Spacer(),
+          Container(
+            width: 240, height: 240,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: _faceIdDone ? AppColors.success : AppColors.accent, width: 2),
+              color: Colors.black26,
+            ),
+            child: _faceIdDone 
+              ? const Icon(Icons.face_rounded, size: 100, color: AppColors.success)
+              : (_isCameraReady 
+                  ? ClipRRect(borderRadius: BorderRadius.circular(18), child: CameraPreview(_cameraController!)) 
+                  : const Center(child: CircularProgressIndicator())),
+          ),
+          const SizedBox(height: 24),
+          if (_faceIdDone)
+            Text('Captured at: ${DateFormat('hh:mm:ss a').format(_faceIdTimestamp!)}',
+                style: const TextStyle(color: AppColors.success, fontWeight: FontWeight.bold)),
+          const Spacer(),
+          if (!_faceIdDone && _isCameraReady)
+            _buildActionButton(
+              label: 'Capture Face ID',
+              onPressed: _enrollFaceId,
+              icon: Icons.camera_alt_rounded,
+            ),
+          if (_faceIdDone)
+            _buildActionButton(
+              label: 'Capture Again',
+              onPressed: () => setState(() => _faceIdDone = false),
+              icon: Icons.refresh_rounded,
+            ),
+          const SizedBox(height: 24),
+          Row(
+            children: [
+              Expanded(child: _buildBackButton()),
+              const SizedBox(width: 16),
+              Expanded(child: _buildNextButton(onPressed: _faceIdDone ? _nextPage : null)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStep4Nfc() {
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        children: [
+          const _StepHeader(title: 'NFC Keyfob', subtitle: 'Do you want to link a physical keyfob?'),
+          const Spacer(),
+          if (_hasNfcChoice == null) ...[
+            const Icon(Icons.contactless_rounded, size: 80, color: Colors.white24),
+            const SizedBox(height: 40),
+            const Text('Does your phone support NFC scanning?', style: TextStyle(color: Colors.white70)),
+            const SizedBox(height: 24),
+            Row(
+              children: [
+                Expanded(child: _buildChoiceButton('YES', true, Icons.check_circle_outline)),
+                const SizedBox(width: 16),
+                Expanded(child: _buildChoiceButton('NO', false, Icons.cancel_outlined)),
+              ],
+            ),
+          ] else if (_hasNfcChoice == true) ...[
+            GestureDetector(
+              onTap: _scanNfc,
+              child: Container(
+                width: 150, height: 150,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _scannedNfcTag != null ? AppColors.success.withOpacity(0.1) : AppColors.accent.withOpacity(0.1),
+                  border: Border.all(color: _scannedNfcTag != null ? AppColors.success : AppColors.accent, width: 2),
+                ),
+                child: Icon(
+                  _nfcScanning ? Icons.sync_rounded : (_scannedNfcTag != null ? Icons.check_rounded : Icons.nfc_rounded),
+                  size: 80,
+                  color: _scannedNfcTag != null ? AppColors.success : AppColors.accent,
+                ),
+              ),
+            ),
+            const SizedBox(height: 24),
+            Text(
+              _nfcScanning ? 'Scanning...' : (_scannedNfcTag != null ? 'Tag Linked: $_scannedNfcTag' : 'Tap to scan your Keyfob'),
+              style: TextStyle(color: _scannedNfcTag != null ? AppColors.success : Colors.white70),
+            ),
+            if (_scannedNfcTag == null && !_nfcScanning) 
+              TextButton(onPressed: () => setState(() => _hasNfcChoice = false), child: const Text('Skip this step', style: TextStyle(color: Colors.white38))),
+          ] else ...[
+            const Icon(Icons.block_rounded, size: 80, color: Colors.white24),
+            const SizedBox(height: 24),
+            const Text('NFC Scanning Skipped', style: TextStyle(color: Colors.white70)),
+            TextButton(onPressed: () => setState(() => _hasNfcChoice = null), child: const Text('Change Choice', style: TextStyle(color: AppColors.accent))),
+          ],
+          const Spacer(),
+          Row(
+            children: [
+              Expanded(child: _buildBackButton()),
+              const SizedBox(width: 16),
+              Expanded(child: _buildNextButton(onPressed: (_hasNfcChoice == false || _scannedNfcTag != null) ? _nextPage : null)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStep5Summary() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        children: [
+          const _StepHeader(title: 'Review Details', subtitle: 'Confirm your registration info'),
+          const SizedBox(height: 24),
+          _buildReviewBox([
+            _ReviewRow(label: 'Full Name', value: _nameController.text),
+            _ReviewRow(label: 'Employee ID', value: _empIdController.text),
+            _ReviewRow(label: 'Email', value: _emailController.text),
+            _ReviewRow(label: 'Role', value: _roleController.text),
+            _ReviewRow(label: 'Fingerprint', value: _fingerprintDone ? '✓ Enrolled' : 'Not set', isSuccess: _fingerprintDone),
+            _ReviewRow(label: 'Face ID', value: _faceIdDone ? '✓ Enrolled' : 'Not set', isSuccess: _faceIdDone),
+            _ReviewRow(label: 'Keyfob Tag', value: _scannedNfcTag ?? 'Not linked'),
+          ]),
+          const SizedBox(height: 32),
+          if (_error != null) 
+            Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: Text(_error!, style: const TextStyle(color: AppColors.error, fontSize: 12)),
+            ),
+          SizedBox(
+            width: double.infinity, height: 56,
+            child: ElevatedButton(
+              onPressed: _isRegistering ? null : _handleFinalRegister,
+              child: _isRegistering ? const CircularProgressIndicator() : const Text('Complete Registration', style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ),
+          const SizedBox(height: 16),
+          _buildBackButton(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildField(TextEditingController controller, String label, IconData icon, {TextInputType? keyboardType, bool obscureText = false, int? maxLength}) {
     return TextFormField(
       controller: controller,
       keyboardType: keyboardType,
-      textCapitalization: textCapitalization,
       obscureText: obscureText,
       maxLength: maxLength,
-      style: const TextStyle(color: AppColors.textPrimary),
+      style: const TextStyle(color: Colors.white),
       decoration: InputDecoration(
-          labelText: label,
-          prefixIcon: Icon(icon, color: AppColors.textMuted),
-          counterText: ''),
-      validator: (value) {
-        if (value == null || value.trim().isEmpty) return 'Field is required';
-        if (maxLength != null && value.length != maxLength)
-          return 'Must be $maxLength digits';
-        return null;
-      },
-    );
-  }
-
-  Widget _buildError() {
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 16),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: AppColors.error.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: AppColors.error.withValues(alpha: 0.3)),
+        labelText: label,
+        prefixIcon: Icon(icon, color: Colors.white38),
+        counterText: '',
       ),
-      child: Text(_error!,
-          style: const TextStyle(color: AppColors.error, fontSize: 12)),
+      validator: (v) => v == null || v.isEmpty ? 'Required' : null,
     );
   }
 
-  Widget _buildSignupButton() {
+  Widget _buildNextButton({required VoidCallback? onPressed}) {
+    return SizedBox(
+      height: 50,
+      child: ElevatedButton(
+        onPressed: onPressed,
+        style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent, foregroundColor: AppColors.primary),
+        child: const Text('Next Step', style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
+    );
+  }
+
+  Widget _buildBackButton() {
+    return SizedBox(
+      height: 50,
+      child: OutlinedButton(
+        onPressed: _prevPage,
+        style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.white24)),
+        child: const Text('Back', style: TextStyle(color: Colors.white)),
+      ),
+    );
+  }
+
+  Widget _buildChoiceButton(String label, bool choice, IconData icon, {bool isFingerprint = false}) {
+    return SizedBox(
+      height: 60,
+      child: ElevatedButton.icon(
+        onPressed: () => setState(() {
+          if (isFingerprint) {
+            _hasFingerprintChoice = choice;
+          } else {
+            _hasNfcChoice = choice;
+          }
+        }),
+        icon: Icon(icon),
+        label: Text(label),
+        style: ElevatedButton.styleFrom(backgroundColor: Colors.white10),
+      ),
+    );
+  }
+
+  Widget _buildActionButton({required String label, required VoidCallback onPressed, required IconData icon}) {
     return SizedBox(
       width: double.infinity, height: 56,
-      child: ElevatedButton(
-        onPressed: _isLoading ? null : _handleSignup,
-        child: _isLoading
-            ? const CircularProgressIndicator(color: AppColors.primary)
-            : const Text('Register Now',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+      child: ElevatedButton.icon(
+        onPressed: onPressed,
+        icon: Icon(icon),
+        label: Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
       ),
     );
   }
 
-  Widget _buildLoginLink() {
-    return TextButton(
-      onPressed: () => Navigator.pop(context),
-      child: RichText(
-        text: const TextSpan(
-          text: 'Already have an account? ',
-          style: TextStyle(color: AppColors.textSecondary, fontSize: 14),
-          children: [
-            TextSpan(
-              text: 'Login',
-              style: TextStyle(
-                  color: AppColors.accent, fontWeight: FontWeight.bold),
-            ),
-          ],
-        ),
+  Widget _buildReviewBox(List<Widget> children) {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Column(children: children),
+    );
+  }
+}
+
+class _StepHeader extends StatelessWidget {
+  final String title, subtitle;
+  const _StepHeader({required this.title, required this.subtitle});
+  @override
+  Widget build(BuildContext context) {
+    return Column(children: [
+      const SizedBox(height: 20),
+      Text(title, style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.white, letterSpacing: -0.5)),
+      const SizedBox(height: 8),
+      Text(subtitle, style: const TextStyle(color: Colors.white38, fontSize: 14)),
+    ]);
+  }
+}
+
+class _ReviewRow extends StatelessWidget {
+  final String label, value;
+  final bool isSuccess;
+  const _ReviewRow({required this.label, required this.value, this.isSuccess = false});
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(color: Colors.white38, fontSize: 13)),
+          Text(value, style: TextStyle(color: isSuccess ? AppColors.success : Colors.white, fontWeight: FontWeight.w600, fontSize: 13)),
+        ],
       ),
     );
   }

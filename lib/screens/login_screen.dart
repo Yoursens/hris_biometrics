@@ -5,7 +5,9 @@ import 'package:nfc_manager/nfc_manager.dart';
 import '../theme/app_theme.dart';
 import '../services/security_service.dart';
 import '../services/database_service.dart';
-import 'dashboard_screen.dart';   // ← changed from main_screen
+import '../services/location_tracking_service.dart';
+import '../models/employee.dart';
+import 'main_screen.dart';
 import 'signup_screen.dart';
 import 'landing_screen.dart';
 
@@ -18,10 +20,8 @@ class LoginScreen extends StatefulWidget {
 
 class _LoginScreenState extends State<LoginScreen>
     with TickerProviderStateMixin {
-  final _empIdController = TextEditingController();
   String _pinInput = '';
   bool _isLoading = false;
-  bool _biometricAvailable = false;
   bool _nfcAvailable = false;
   String? _error;
   late AnimationController _shakeController;
@@ -41,12 +41,9 @@ class _LoginScreenState extends State<LoginScreen>
   }
 
   Future<void> _checkCapabilities() async {
-    final bioAvailable =
-    await SecurityService.instance.isBiometricAvailable();
     final nfcAvailable = await NfcManager.instance.isAvailable();
     if (mounted) {
       setState(() {
-        _biometricAvailable = bioAvailable;
         _nfcAvailable = nfcAvailable;
       });
     }
@@ -220,11 +217,11 @@ class _LoginScreenState extends State<LoginScreen>
           ElevatedButton(
             onPressed: () {
               Navigator.pop(context);
-              // Navigate to signup with the tagId pre-filled
+              // Navigate to signup
               Navigator.pushReplacement(
                 context,
                 MaterialPageRoute(
-                  builder: (_) => SignupScreen(prefilledNfcTag: tagId),
+                  builder: (_) => const SignupScreen(),
                 ),
               );
             },
@@ -241,36 +238,7 @@ class _LoginScreenState extends State<LoginScreen>
     );
   }
 
-  // ─── Biometric login ──────────────────────────────────────────────────────
-  Future<void> _loginWithBiometric() async {
-    setState(() {
-      _isLoading = true;
-      _error = null;
-    });
-    try {
-      final success = await SecurityService.instance
-          .authenticateWithBiometric(reason: 'Verify identity to login');
-      if (!mounted) return;
-      if (success) {
-        final lastId = await SecurityService.instance.getCurrentEmployeeId();
-        if (lastId == null) throw 'No saved session. Please login with PIN first.';
-        await _openSession(lastId);
-      } else {
-        _setError('Biometric authentication failed.');
-      }
-    } catch (e) {
-      _setError('Login error: $e');
-    }
-  }
-
-  // ─── PIN login ────────────────────────────────────────────────────────────
   Future<void> _loginWithPin() async {
-    final rawId = _empIdController.text.trim().toUpperCase();
-    if (rawId.isEmpty) {
-      _setError('Enter your Employee ID first.');
-      _shakeController.forward(from: 0);
-      return;
-    }
     if (_pinInput.length < 4) return;
 
     setState(() {
@@ -279,15 +247,23 @@ class _LoginScreenState extends State<LoginScreen>
     });
 
     try {
-      final employee =
-      await DatabaseService.instance.getEmployeeByEmployeeId(rawId);
-      if (employee == null) throw 'Employee ID not found.';
+      // Find employee by PIN only (iterating through all local employees)
+      final List<Employee> allEmployees = await DatabaseService.instance.getAllEmployees();
+      Employee? matchedEmployee;
 
-      final valid =
-      await SecurityService.instance.verifyPin(employee.id, _pinInput);
-      if (!valid) throw 'Incorrect PIN. Please try again.';
+      for (var emp in allEmployees) {
+        final isValid = await SecurityService.instance.verifyPin(emp.id, _pinInput);
+        if (isValid) {
+          matchedEmployee = emp;
+          break;
+        }
+      }
 
-      await _openSession(employee.id);
+      if (matchedEmployee == null) {
+        throw 'Invalid PIN. Please try again.';
+      }
+
+      await _openSession(matchedEmployee.id);
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -300,26 +276,15 @@ class _LoginScreenState extends State<LoginScreen>
     }
   }
 
-  // ─── Demo login ───────────────────────────────────────────────────────────
-  Future<void> _loginAsDemo() async {
-    setState(() {
-      _isLoading = true;
-      _error = null;
-    });
-    await Future.delayed(const Duration(milliseconds: 500));
-    await _openSession(SecurityService.demoEmpId);
-  }
-
-  // ─── Open session & navigate to Dashboard ────────────────────────────────
   Future<void> _openSession(String employeeId) async {
     try {
       await SecurityService.instance.createSession(employeeId);
-      if (!mounted) return;
+      LocationTrackingService.instance.startTracking(employeeId);
 
-      // ✅ Navigate to DashboardScreen, clear back stack
+      if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const DashboardScreen()),
-            (route) => false,
+        MaterialPageRoute(builder: (_) => const MainScreen()),
+        (route) => false,
       );
     } catch (e) {
       if (mounted) {
@@ -347,8 +312,7 @@ class _LoginScreenState extends State<LoginScreen>
     setState(() => _error = null);
     if (key == 'del') {
       if (_pinInput.isNotEmpty) {
-        setState(() =>
-        _pinInput = _pinInput.substring(0, _pinInput.length - 1));
+        setState(() => _pinInput = _pinInput.substring(0, _pinInput.length - 1));
       }
     } else if (_pinInput.length < 4) {
       setState(() => _pinInput += key);
@@ -360,75 +324,53 @@ class _LoginScreenState extends State<LoginScreen>
 
   @override
   void dispose() {
-    _empIdController.dispose();
     _shakeController.dispose();
     try { NfcManager.instance.stopSession(); } catch (_) {}
     super.dispose();
   }
 
-  // ─── Build ────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
-        Navigator.pushReplacement(context,
-            MaterialPageRoute(builder: (_) => const LandingScreen()));
+        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LandingScreen()));
       },
       child: Scaffold(
         body: Container(
-          decoration:
-          const BoxDecoration(gradient: AppColors.gradientDark),
+          decoration: const BoxDecoration(gradient: AppColors.gradientDark),
           child: SafeArea(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: Column(
-                children: [
-                  const SizedBox(height: 32),
-                  _buildLogo(),
-                  if (_statusAction.isNotEmpty) ...[
-                    const SizedBox(height: 20),
-                    _buildStatusBanner(),
-                  ],
-                  const SizedBox(height: 32),
-                  if (_biometricAvailable || _nfcAvailable) ...[
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        if (_biometricAvailable)
-                          _buildBiometricButton(),
-                        if (_biometricAvailable && _nfcAvailable)
-                          const SizedBox(width: 32),
-                        if (_nfcAvailable) _buildNfcButton(),
-                      ],
-                    ),
+            child: Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    _buildLogo(),
+                    if (_statusAction.isNotEmpty) ...[
+                      const SizedBox(height: 20),
+                      _buildStatusBanner(),
+                    ],
+                    const SizedBox(height: 48),
+                    if (_nfcAvailable) ...[
+                      _buildNfcSection(),
+                      const SizedBox(height: 32),
+                      _buildDivider(),
+                      const SizedBox(height: 32),
+                    ],
+                    const Text('Enter Access PIN',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: AppColors.textSecondary)),
                     const SizedBox(height: 24),
-                    _buildDivider(),
-                    const SizedBox(height: 20),
+                    _buildPinDots(),
+                    const SizedBox(height: 48),
+                    _buildPinPad(),
+                    const SizedBox(height: 24),
+                    _buildFeedback(),
+                    const SizedBox(height: 32),
+                    _buildSignupLink(),
                   ],
-                  _buildEmployeeIdField(),
-                  const SizedBox(height: 20),
-                  const Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text('Enter PIN',
-                        style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                            color: AppColors.textSecondary)),
-                  ),
-                  const SizedBox(height: 12),
-                  _buildPinDots(),
-                  const SizedBox(height: 20),
-                  _buildPinPad(),
-                  const SizedBox(height: 16),
-                  _buildFeedback(),
-                  const SizedBox(height: 20),
-                  _buildDemoButton(),
-                  const SizedBox(height: 24),
-                  _buildSignupLink(),
-                  const SizedBox(height: 40),
-                ],
+                ),
               ),
             ),
           ),
@@ -440,30 +382,19 @@ class _LoginScreenState extends State<LoginScreen>
   Widget _buildLogo() {
     return Column(children: [
       Container(
-        width: 68, height: 68,
+        width: 80, height: 80,
         decoration: BoxDecoration(
           gradient: AppColors.gradientPrimary,
-          borderRadius: BorderRadius.circular(18),
+          borderRadius: BorderRadius.circular(20),
           boxShadow: [
-            BoxShadow(
-                color: AppColors.accent.withValues(alpha: 0.4),
-                blurRadius: 20,
-                offset: const Offset(0, 8))
+            BoxShadow(color: AppColors.accent.withValues(alpha: 0.4), blurRadius: 25, offset: const Offset(0, 10))
           ],
         ),
-        child: const Icon(Icons.shield_rounded,
-            color: AppColors.primary, size: 34),
+        child: const Icon(Icons.shield_rounded, color: AppColors.primary, size: 40),
       ),
-      const SizedBox(height: 16),
-      const Text('Welcome Back',
-          style: TextStyle(
-              fontSize: 26,
-              fontWeight: FontWeight.w800,
-              color: AppColors.textPrimary,
-              letterSpacing: -0.8)),
-      const SizedBox(height: 6),
-      const Text('Enter your credentials to login',
-          style: TextStyle(fontSize: 13, color: AppColors.textSecondary)),
+      const SizedBox(height: 24),
+      const Text('Secure Access',
+          style: TextStyle(fontSize: 32, fontWeight: FontWeight.w900, color: AppColors.textPrimary, letterSpacing: -1)),
     ]);
   }
 
@@ -512,62 +443,28 @@ class _LoginScreenState extends State<LoginScreen>
     );
   }
 
-  Widget _buildBiometricButton() {
-    return GestureDetector(
-      onTap: _isLoading ? null : _loginWithBiometric,
-      child: Container(
-        width: 80, height: 80,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          gradient: AppColors.gradientPrimary,
-          boxShadow: [
-            BoxShadow(
-                color: AppColors.accent.withValues(alpha: 0.4),
-                blurRadius: 24,
-                spreadRadius: 4)
-          ],
-        ),
-        child: _isLoading
-            ? const Center(child: CircularProgressIndicator(
-            color: AppColors.primary, strokeWidth: 3))
-            : const Icon(Icons.fingerprint_rounded,
-            color: AppColors.primary, size: 42),
-      ),
-    );
-  }
-
-  Widget _buildNfcButton() {
+  Widget _buildNfcSection() {
     return GestureDetector(
       onTap: _isLoading ? null : _startNfcSession,
       child: Container(
-        width: 80, height: 80,
+        width: 120, height: 120,
         decoration: BoxDecoration(
           shape: BoxShape.circle,
           color: AppColors.card,
-          border: Border.all(
-              color: AppColors.accent.withValues(alpha: 0.5), width: 2),
+          border: Border.all(color: AppColors.accent.withValues(alpha: 0.5), width: 2),
           boxShadow: [
-            BoxShadow(
-                color: AppColors.accent.withValues(alpha: 0.2),
-                blurRadius: 24,
-                spreadRadius: 4)
+            BoxShadow(color: AppColors.accent.withValues(alpha: 0.2), blurRadius: 24, spreadRadius: 4)
           ],
         ),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             _isLoading
-                ? const CircularProgressIndicator(
-                color: AppColors.accent, strokeWidth: 2)
-                : const Icon(Icons.contactless_rounded,
-                color: AppColors.accent, size: 36),
+                ? const CircularProgressIndicator(color: AppColors.accent, strokeWidth: 2)
+                : const Icon(Icons.contactless_rounded, color: AppColors.accent, size: 48),
             if (!_isLoading) ...[
-              const SizedBox(height: 4),
-              const Text('TAP KEYFOB',
-                  style: TextStyle(
-                      color: AppColors.accent,
-                      fontSize: 8,
-                      fontWeight: FontWeight.w900)),
+              const SizedBox(height: 8),
+              const Text('TAP KEYFOB', style: TextStyle(color: AppColors.accent, fontSize: 10, fontWeight: FontWeight.w900)),
             ],
           ],
         ),
@@ -590,20 +487,6 @@ class _LoginScreenState extends State<LoginScreen>
     ]);
   }
 
-  Widget _buildEmployeeIdField() {
-    return TextField(
-      controller: _empIdController,
-      onChanged: (_) => setState(() { _error = null; _pinInput = ''; }),
-      decoration: const InputDecoration(
-        labelText: 'Employee ID',
-        hintText: 'e.g. EMP-2024-001',
-        prefixIcon: Icon(Icons.badge_outlined, color: AppColors.textMuted),
-      ),
-      style: const TextStyle(color: AppColors.textPrimary),
-      textCapitalization: TextCapitalization.characters,
-    );
-  }
-
   Widget _buildPinDots() {
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
@@ -611,14 +494,12 @@ class _LoginScreenState extends State<LoginScreen>
         final filled = i < _pinInput.length;
         return AnimatedContainer(
           duration: const Duration(milliseconds: 180),
-          margin: const EdgeInsets.symmetric(horizontal: 10),
-          width: 16, height: 16,
+          margin: const EdgeInsets.symmetric(horizontal: 12),
+          width: 20, height: 20,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             color: filled ? AppColors.accent : Colors.transparent,
-            border: Border.all(
-                color: filled ? AppColors.accent : AppColors.textMuted,
-                width: 2),
+            border: Border.all(color: filled ? AppColors.accent : AppColors.textMuted, width: 2.5),
           ),
         );
       }),
@@ -626,20 +507,12 @@ class _LoginScreenState extends State<LoginScreen>
   }
 
   Widget _buildPinPad() {
-    const rows = [
-      ['1', '2', '3'],
-      ['4', '5', '6'],
-      ['7', '8', '9'],
-      ['',  '0', 'del'],
-    ];
+    const rows = [ ['1', '2', '3'], ['4', '5', '6'], ['7', '8', '9'], ['', '0', 'del'] ];
     return GridView.builder(
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 3,
-          childAspectRatio: 2.2,
-          mainAxisSpacing: 8,
-          crossAxisSpacing: 8),
+          crossAxisCount: 3, childAspectRatio: 1.8, mainAxisSpacing: 16, crossAxisSpacing: 16),
       itemCount: 12,
       itemBuilder: (_, idx) {
         final key = rows[idx ~/ 3][idx % 3];
@@ -649,18 +522,13 @@ class _LoginScreenState extends State<LoginScreen>
           child: Container(
             decoration: BoxDecoration(
               color: AppColors.card,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: AppColors.cardBorder),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: AppColors.cardBorder, width: 1.5),
             ),
             child: Center(
               child: key == 'del'
-                  ? const Icon(Icons.backspace_outlined,
-                  color: AppColors.textSecondary, size: 20)
-                  : Text(key,
-                  style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w700,
-                      color: AppColors.textPrimary)),
+                  ? const Icon(Icons.backspace_outlined, color: AppColors.textSecondary, size: 24)
+                  : Text(key, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: AppColors.textPrimary)),
             ),
           ),
         );
@@ -669,89 +537,31 @@ class _LoginScreenState extends State<LoginScreen>
   }
 
   Widget _buildFeedback() {
-    if (_isLoading) {
-      return const SizedBox(
-        height: 24,
-        child: Center(child: CircularProgressIndicator(
-            color: AppColors.accent, strokeWidth: 2)),
-      );
-    }
+    if (_isLoading) return const SizedBox(height: 30, child: Center(child: CircularProgressIndicator(color: AppColors.accent, strokeWidth: 3)));
     if (_error != null) {
       return AnimatedBuilder(
         animation: _shakeAnim,
         builder: (_, child) => Transform.translate(
-          offset: Offset(
-              _shakeAnim.value *
-                  ((_shakeController.value * 10).round().isEven ? 1 : -1),
-              0),
+          offset: Offset(_shakeAnim.value * ((_shakeController.value * 10).round().isEven ? 1 : -1), 0),
           child: child,
         ),
-        child: Container(
-          width: double.infinity,
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          decoration: BoxDecoration(
-            color: AppColors.error.withValues(alpha: 0.08),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: AppColors.error.withValues(alpha: 0.3)),
-          ),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Icon(Icons.error_outline, color: AppColors.error, size: 16),
-              const SizedBox(width: 8),
-              Expanded(child: Text(_error!,
-                  style: const TextStyle(
-                      color: AppColors.error, fontSize: 12, height: 1.4))),
-            ],
-          ),
-        ),
+        child: Text(_error!, style: const TextStyle(color: AppColors.error, fontSize: 14, fontWeight: FontWeight.w600)),
       );
     }
-    return const SizedBox(height: 24);
-  }
-
-  Widget _buildDemoButton() {
-    return SizedBox(
-      width: double.infinity, height: 56,
-      child: ElevatedButton(
-        onPressed: _isLoading ? null : _loginAsDemo,
-        style: ElevatedButton.styleFrom(
-          backgroundColor: AppColors.accent.withValues(alpha: 0.1),
-          foregroundColor: AppColors.accent,
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
-              side: const BorderSide(color: AppColors.accent, width: 1.5)),
-        ),
-        child: const Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.auto_awesome_rounded, size: 20),
-            SizedBox(width: 12),
-            Text('Explore Demo Version',
-                style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 0.5)),
-          ],
-        ),
-      ),
-    );
+    return const SizedBox(height: 30);
   }
 
   Widget _buildSignupLink() {
     return TextButton(
-      onPressed: () => Navigator.pushReplacement(context,
-          MaterialPageRoute(builder: (_) => const SignupScreen())),
+      onPressed: () => Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const SignupScreen())),
       child: RichText(
         text: const TextSpan(
           text: "Don't have an account? ",
           style: TextStyle(color: AppColors.textSecondary, fontSize: 14),
           children: [
             TextSpan(
-              text: 'Register Now',
-              style: TextStyle(
-                  color: AppColors.accent, fontWeight: FontWeight.bold),
+              text: 'Register',
+              style: TextStyle(color: AppColors.accent, fontWeight: FontWeight.bold),
             ),
           ],
         ),

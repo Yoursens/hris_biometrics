@@ -1,50 +1,64 @@
 // lib/main.dart
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:provider/provider.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'theme/app_theme.dart';
+import 'theme/theme_notifier.dart';
 import 'services/database_service.dart';
 import 'data/local/dao/connectivity_service.dart';
 import 'data/local/dao/sync_service.dart';
 import 'screens/landing_screen.dart';
+import 'screens/admin_dashboard.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await SystemChrome.setPreferredOrientations([
-    DeviceOrientation.portraitUp,
-    DeviceOrientation.portraitDown,
-  ]);
-
-  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-    statusBarColor: Colors.transparent,
-    statusBarIconBrightness: Brightness.light,
-    systemNavigationBarColor: Color(0xFF0A1628),
-    systemNavigationBarIconBrightness: Brightness.light,
-  ));
-
-  // 1. Init SQLite database (creates all tables)
-  await DatabaseService.instance.database;
-
-  // 2. Scan local JSON files → restore any missing rows into SQLite
-  //    Runs silently — if the DB was wiped or app crashed, files are the backup
+  // 1. Initialize Firebase first
   try {
-    final syncResult =
-    await DatabaseService.instance.syncLocalFilesToDatabase();
-    if (syncResult.hasChanges) {
-      debugPrint(
-          '✅ Restored ${syncResult.inserted} attendance record(s) from local files');
+    if (kIsWeb) {
+      if (Firebase.apps.isEmpty) {
+        await Firebase.initializeApp(
+          options: const FirebaseOptions(
+            apiKey: "AIzaSyAIfs300WjCmdeejsEw50lV2VxMjf-5QVg",
+            authDomain: "week-9-activity-53484.firebaseapp.com",
+            projectId: "week-9-activity-53484",
+            storageBucket: "week-9-activity-53484.firebasestorage.app",
+            messagingSenderId: "1095102475957",
+            appId: "1:1095102475957:web:45a4624634e83b53e4d8fc",
+            measurementId: "G-605G4TDLCX",
+          ),
+        );
+      }
+    } else {
+      await Firebase.initializeApp();
     }
   } catch (e) {
-    debugPrint('⚠️ Local file sync skipped: $e');
+    debugPrint('Firebase Init Error: $e');
   }
 
-  // 3. Start connectivity watcher (detects wifi/mobile on/off)
-  await ConnectivityService.instance.init();
+  // 2. Initialize Mobile-only services
+  if (!kIsWeb) {
+    await SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
+    await DatabaseService.instance.database;
+    await ConnectivityService.instance.init();
+    await SyncService.instance.init();
+  }
 
-  // 4. Start sync queue — auto-uploads pending records to server when online
-  await SyncService.instance.init();
+  // 3. Theme logic (Works on both)
+  final themeNotifier = ThemeNotifier();
+  await themeNotifier.loadFromPrefs();
 
-  runApp(const HRISBioApp());
+  runApp(
+    ChangeNotifierProvider<ThemeNotifier>.value(
+      value: themeNotifier,
+      child: const HRISBioApp(),
+    ),
+  );
 }
 
 class HRISBioApp extends StatelessWidget {
@@ -52,24 +66,29 @@ class HRISBioApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'HRIS Biometrics',
-      debugShowCheckedModeBanner: false,
-      theme: AppTheme.darkTheme,
-      home: const SplashScreen(),
+    return Consumer<ThemeNotifier>(
+      builder: (context, themeNotifier, _) {
+        return MaterialApp(
+          title: 'HRIS Master Dashboard',
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.lightTheme,
+          darkTheme: AppTheme.darkTheme,
+          themeMode: themeNotifier.themeMode,
+          // ✅ IF WEB -> SHOW ADMIN DASHBOARD IMMEDIATELY
+          home: kIsWeb ? const AdminDashboard() : const SplashScreen(),
+        );
+      },
     );
   }
 }
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
-
   @override
   State<SplashScreen> createState() => _SplashScreenState();
 }
 
-class _SplashScreenState extends State<SplashScreen>
-    with SingleTickerProviderStateMixin {
+class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderStateMixin {
   late AnimationController _ctrl;
   late Animation<double> _scale;
   late Animation<double> _fade;
@@ -77,102 +96,47 @@ class _SplashScreenState extends State<SplashScreen>
   @override
   void initState() {
     super.initState();
-    _ctrl = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 1500));
-    _scale = Tween<double>(begin: 0.5, end: 1.0).animate(
-        CurvedAnimation(parent: _ctrl, curve: Curves.elasticOut));
-    _fade = Tween<double>(begin: 0.0, end: 1.0).animate(
-        CurvedAnimation(parent: _ctrl, curve: const Interval(0.0, 0.5)));
+    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1500));
+    _scale = Tween<double>(begin: 0.5, end: 1.0).animate(CurvedAnimation(parent: _ctrl, curve: Curves.elasticOut));
+    _fade = Tween<double>(begin: 0.0, end: 1.0).animate(CurvedAnimation(parent: _ctrl, curve: const Interval(0.0, 0.5)));
     _ctrl.forward();
 
     Future.delayed(const Duration(milliseconds: 2500), () {
       if (mounted) {
-        Navigator.pushReplacement(
-          context,
-          PageRouteBuilder(
-            pageBuilder: (_, __, ___) => const LandingScreen(),
-            transitionDuration: const Duration(milliseconds: 600),
-            transitionsBuilder: (_, anim, __, child) =>
-                FadeTransition(opacity: anim, child: child),
-          ),
-        );
+        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LandingScreen()));
       }
     });
   }
 
   @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
+  void dispose() { _ctrl.dispose(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.gradientDark),
+        decoration: BoxDecoration(gradient: AppColors.gradientDark),
         child: Center(
-          child: AnimatedBuilder(
-            animation: _ctrl,
-            builder: (_, __) => FadeTransition(
-              opacity: _fade,
-              child: ScaleTransition(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ScaleTransition(
                 scale: _scale,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 100,
-                      height: 100,
-                      decoration: BoxDecoration(
-                        gradient: AppColors.gradientPrimary,
-                        borderRadius: BorderRadius.circular(28),
-                        boxShadow: [
-                          BoxShadow(
-                            color: AppColors.accent.withOpacity(0.5),
-                            blurRadius: 40,
-                            spreadRadius: 10,
-                          ),
-                        ],
-                      ),
-                      child: const Icon(
-                        Icons.fingerprint_rounded,
-                        color: AppColors.primary,
-                        size: 52,
-                      ),
+                child: FadeTransition(
+                  opacity: _fade,
+                  child: Container(
+                    width: 100, height: 100,
+                    decoration: BoxDecoration(
+                      gradient: AppColors.gradientPrimary,
+                      borderRadius: BorderRadius.circular(28),
                     ),
-                    const SizedBox(height: 24),
-                    const Text(
-                      'HRIS Biometrics',
-                      style: TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.w800,
-                        color: AppColors.textPrimary,
-                        letterSpacing: -1,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    const Text(
-                      'Smart Workforce Management',
-                      style: TextStyle(
-                        fontSize: 14,
-                        color: AppColors.textSecondary,
-                      ),
-                    ),
-                    const SizedBox(height: 48),
-                    SizedBox(
-                      width: 200,
-                      child: LinearProgressIndicator(
-                        backgroundColor: AppColors.cardBorder,
-                        valueColor:
-                        const AlwaysStoppedAnimation(AppColors.accent),
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                    ),
-                  ],
+                    child: const Icon(Icons.fingerprint_rounded, color: Colors.white, size: 52),
+                  ),
                 ),
               ),
-            ),
+              const SizedBox(height: 24),
+              const Text('HRIS Biometrics', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w800, color: Colors.white)),
+            ],
           ),
         ),
       ),

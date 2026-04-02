@@ -51,11 +51,11 @@ class GeofenceService {
   GeofenceService._();
   static final GeofenceService instance = GeofenceService._();
 
-  // Office Location: 240 Lacson Ave, Sampaloc, Manila
-  static const double _officeLat = 14.6068;
-  static const double _officeLng = 120.9961;
-  static const String _officeAddress = '240 Lacson Ave, Sampaloc, Manila';
-  static const double _allowedRadiusMeters = 100.0;
+  // Location: 240 Lacson Avenue
+  static const double _officeLat          = 14.6114;
+  static const double _officeLng          = 120.9936;
+  static const String _officeAddress      = '240 Lacson Avenue, Sampaloc, Manila, Philippines';
+  static const double _allowedRadiusMeters = 1500.0;
 
   final _statusController = StreamController<GeofenceResult>.broadcast();
   Stream<GeofenceResult> get statusStream => _statusController.stream;
@@ -64,6 +64,11 @@ class GeofenceService {
   GeofenceResult? _lastResult;
   GeofenceResult? get lastResult => _lastResult;
   bool get isInsideGeofence => _lastResult?.isInside ?? false;
+
+  static double get allowedRadius => _allowedRadiusMeters;
+  static String get officeAddress => _officeAddress;
+  static double get officeLat     => _officeLat;
+  static double get officeLng     => _officeLng;
 
   Future<GeofenceResult> checkGeofence() async {
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
@@ -94,7 +99,6 @@ class GeofenceService {
       ));
     }
 
-    // Emit loading state while fetching position
     _emit(const GeofenceResult(
       isAllowed: false,
       status: GeofenceStatus.loading,
@@ -102,7 +106,6 @@ class GeofenceService {
     ));
 
     try {
-      // FIX: Use desiredAccuracy instead of locationSettings for one-shot position
       final position = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       ).timeout(
@@ -184,7 +187,7 @@ class GeofenceService {
       lat2: _officeLat,
       lng2: _officeLng,
     );
-    final inside = distance <= _allowedRadiusMeters;
+    final inside    = distance <= _allowedRadiusMeters;
     final remaining = _allowedRadiusMeters - distance;
 
     final String message;
@@ -228,9 +231,4 @@ class GeofenceService {
   }
 
   double _toRad(double deg) => deg * (pi / 180);
-
-  static double get officeLat     => _officeLat;
-  static double get officeLng     => _officeLng;
-  static double get allowedRadius => _allowedRadiusMeters;
-  static String get officeAddress => _officeAddress;
 }

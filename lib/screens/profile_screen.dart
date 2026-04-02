@@ -1,8 +1,16 @@
 // lib/screens/profile_screen.dart
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:local_auth/local_auth.dart';
+import 'package:provider/provider.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+
 import '../theme/app_theme.dart';
+import '../theme/theme_notifier.dart';
 import '../services/database_service.dart';
 import '../services/security_service.dart';
+import '../services/auth_service.dart';
 import '../models/employee.dart';
 import 'landing_screen.dart';
 import 'attendance_history_screen.dart';
@@ -17,7 +25,8 @@ class ProfileScreen extends StatefulWidget {
 class _ProfileScreenState extends State<ProfileScreen> {
   Employee? _employee;
   bool _loading = true;
-  bool _biometricEnabled = true;
+  bool _isSyncing = false;
+  final _localAuth = LocalAuthentication();
 
   @override
   void initState() {
@@ -26,15 +35,19 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _load() async {
-    final empId = await SecurityService.instance.getCurrentEmployeeId() ?? 'emp_001';
+    final empId =
+        await SecurityService.instance.getCurrentEmployeeId() ?? 'emp_001';
     final employee = await DatabaseService.instance.getEmployeeById(empId);
-    if (mounted) setState(() {
-      _employee = employee;
-      _loading = false;
-    });
+    if (mounted) {
+      setState(() {
+        _employee = employee;
+        _loading = false;
+      });
+    }
   }
 
   Future<void> _logout() async {
+    await AuthService.instance.signOut();
     await SecurityService.instance.clearSession();
     if (!mounted) return;
     Navigator.pushAndRemoveUntil(
@@ -44,32 +57,225 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
+  Future<void> _syncToFirebase() async {
+    if (_employee == null || _isSyncing) return;
+    
+    setState(() => _isSyncing = true);
+    
+    try {
+      User? user = AuthService.instance.currentUser;
+      
+      if (user == null) {
+        final pin = await _promptForPin();
+        if (pin == null || pin.length < 4) {
+          throw 'Valid 4-digit PIN required to link cloud account';
+        }
+
+        final email = _employee!.email;
+        final password = pin.padRight(6, '0');
+
+        try {
+          await AuthService.instance.login(email: email, password: password);
+        } catch (e) {
+          await AuthService.instance.registerEmployee(
+            email: email,
+            password: password,
+            employee: _employee!,
+          );
+        }
+        user = AuthService.instance.currentUser;
+      }
+
+      if (user == null) throw 'Could not authenticate with Firebase';
+
+      final data = _employee!.toMap();
+      data['uid'] = user.uid;
+      data['last_manual_sync'] = FieldValue.serverTimestamp();
+
+      await FirebaseFirestore.instance
+          .collection('employees')
+          .doc(user.uid)
+          .set(data, SetOptions(merge: true));
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('✓ Profile successfully backed up to Cloud!'),
+            backgroundColor: AppColors.success,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Sync failed: $e'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isSyncing = false);
+    }
+  }
+
+  Future<String?> _promptForPin() async {
+    String pinInput = '';
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.card,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text('Link Cloud Account', 
+          style: TextStyle(color: AppColors.textPrimary, fontWeight: FontWeight.bold)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Enter your 4-digit PIN to secure your cloud backup.',
+              style: TextStyle(color: AppColors.textSecondary, fontSize: 13)),
+            const SizedBox(height: 16),
+            TextField(
+              obscureText: true,
+              keyboardType: TextInputType.number,
+              maxLength: 4,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 24, letterSpacing: 8, color: AppColors.textPrimary),
+              onChanged: (v) => pinInput = v,
+              decoration: const InputDecoration(
+                hintText: 'PIN',
+                counterText: '',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel', style: TextStyle(color: AppColors.textMuted)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, pinInput),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent),
+            child: const Text('Confirm', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _enroll(String type) async {
+    if (_employee == null) return;
+    bool canCheck = await _localAuth.canCheckBiometrics ||
+        await _localAuth.isDeviceSupported();
+    if (!canCheck) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Biometrics not available.'),
+          backgroundColor: AppColors.error,
+        ),
+      );
+      return;
+    }
+    try {
+      bool authenticated = await _localAuth.authenticate(
+        localizedReason: 'Scan to enroll $type',
+        options:
+        const AuthenticationOptions(biometricOnly: true, stickyAuth: true),
+      );
+      if (authenticated) {
+        await _updateBiometricFlag(type, enrolled: true);
+        final updated =
+        await DatabaseService.instance.getEmployeeById(_employee!.id);
+        if (mounted) {
+          setState(() => _employee = updated);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('$type enrolled successfully'),
+              backgroundColor: AppColors.success,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint("Enrollment error: $e");
+    }
+  }
+
+  Future<void> _unenroll(String type) async {
+    if (_employee == null) return;
+    await _updateBiometricFlag(type, enrolled: false);
+    final updated =
+    await DatabaseService.instance.getEmployeeById(_employee!.id);
+    if (mounted) {
+      setState(() => _employee = updated);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('$type removed'),
+          backgroundColor: AppColors.warning,
+        ),
+      );
+    }
+  }
+
+  Future<void> _updateBiometricFlag(String type,
+      {required bool enrolled}) async {
+    final emp = _employee;
+    if (emp == null) return;
+    final Employee updatedEmployee;
+    if (type == 'Face ID') {
+      updatedEmployee = emp.copyWith(
+        faceEmbedding: enrolled ? emp.faceEmbedding : null,
+      );
+    } else if (type == 'Fingerprint') {
+      updatedEmployee = emp.copyWith(
+        fingerprintHash: enrolled ? emp.fingerprintHash : null,
+      );
+    } else {
+      return;
+    }
+    await DatabaseService.instance.updateEmployee(updatedEmployee);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+
     if (_loading) {
-      return const Scaffold(
-        backgroundColor: AppColors.primary,
-        body: Center(child: CircularProgressIndicator(color: AppColors.accent)),
+      return Scaffold(
+        backgroundColor: theme.scaffoldBackgroundColor,
+        body: Center(
+            child: CircularProgressIndicator(color: cs.primary)),
       );
     }
 
+    final themeNotifier = context.watch<ThemeNotifier>();
+
     return Scaffold(
-      backgroundColor: AppColors.primary,
+      backgroundColor: theme.scaffoldBackgroundColor,
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.all(20),
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 120), // Added bottom padding for navbar clearance
           child: Column(
             children: [
-              _buildProfileCard(),
+              _buildProfileCard(theme, cs, isDark),
               const SizedBox(height: 20),
-              _buildBiometricStatus(),
+              
+              _buildSyncSection(theme, cs),
               const SizedBox(height: 20),
-              _buildSettings(),
+
+              _buildBiometricStatus(theme, cs),
               const SizedBox(height: 20),
-              _buildSecuritySection(),
+              _buildSettings(theme, cs, themeNotifier),
+              const SizedBox(height: 20),
+              _buildSecuritySection(theme, cs),
               const SizedBox(height: 20),
               _buildLogout(),
-              const SizedBox(height: 40),
+              // Additional safety space
+              const SizedBox(height: 20),
             ],
           ),
         ),
@@ -77,87 +283,57 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
-  Widget _buildProfileCard() {
+  Widget _buildProfileCard(
+      ThemeData theme, ColorScheme cs, bool isDark) {
     return Container(
       padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            AppColors.accent.withOpacity(0.2),
-            AppColors.accentSecondary.withOpacity(0.1),
-          ],
-        ),
+        color: theme.cardColor,
         borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: AppColors.accent.withOpacity(0.3)),
+        border: Border.all(color: theme.dividerColor),
       ),
       child: Row(
         children: [
-          Stack(
-            children: [
-              Container(
-                width: 72,
-                height: 72,
-                decoration: BoxDecoration(
-                  gradient: AppColors.gradientPrimary,
-                  shape: BoxShape.circle,
-                  boxShadow: [
-                    BoxShadow(
-                      color: AppColors.accent.withOpacity(0.4),
-                      blurRadius: 16,
-                    ),
-                  ],
-                ),
-                child: Center(
-                  child: Text(_employee?.initials ?? 'EM',
-                      style: const TextStyle(
-                        fontSize: 24,
-                        fontWeight: FontWeight.w800,
-                        color: AppColors.primary,
-                      )),
+          Container(
+            width: 72,
+            height: 72,
+            decoration: const BoxDecoration(
+              gradient: AppColors.gradientPrimary,
+              shape: BoxShape.circle,
+            ),
+            child: Center(
+              child: Text(
+                _employee?.initials ?? '??',
+                style: const TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
                 ),
               ),
-              Positioned(
-                right: 0,
-                bottom: 0,
-                child: Container(
-                  width: 20,
-                  height: 20,
-                  decoration: BoxDecoration(
-                    color: AppColors.success,
-                    shape: BoxShape.circle,
-                    border: Border.all(color: AppColors.primary, width: 2),
-                  ),
-                ),
-              ),
-            ],
+            ),
           ),
           const SizedBox(width: 16),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(_employee?.fullName ?? 'Employee',
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w800,
-                      color: AppColors.textPrimary,
-                      letterSpacing: -0.5,
-                    )),
+                Text(
+                  _employee?.fullName ?? 'Unknown',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: cs.onSurface,
+                  ),
+                ),
+                Text(
+                  _employee?.position ?? 'Position',
+                  style: TextStyle(color: cs.onSurface.withOpacity(0.6)),
+                ),
                 const SizedBox(height: 4),
-                Text(_employee?.position ?? '',
-                    style: const TextStyle(
-                      fontSize: 14,
-                      color: AppColors.textSecondary,
-                    )),
-                const SizedBox(height: 4),
-                Text(_employee?.employeeId ?? '',
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: AppColors.accent,
-                      fontWeight: FontWeight.w600,
-                    )),
+                Text(
+                  _employee?.email ?? '',
+                  style: TextStyle(color: cs.onSurface.withOpacity(0.4), fontSize: 12),
+                ),
               ],
             ),
           ),
@@ -166,243 +342,128 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
-  Widget _buildBiometricStatus() {
+  Widget _buildSyncSection(ThemeData theme, ColorScheme cs) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppColors.accent.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: AppColors.accent.withOpacity(0.2)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.cloud_sync_rounded, color: AppColors.accent, size: 24),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Cloud Backup', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                Text('Backup your profile to Firebase', style: TextStyle(fontSize: 11, color: Colors.grey)),
+              ],
+            ),
+          ),
+          ElevatedButton(
+            onPressed: _isSyncing ? null : _syncToFirebase,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.accent,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            child: _isSyncing 
+              ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+              : const Text('Sync Now', style: TextStyle(fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBiometricStatus(ThemeData theme, ColorScheme cs) {
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        gradient: AppColors.gradientCard,
+        color: theme.cardColor,
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.cardBorder),
+        border: Border.all(color: theme.dividerColor),
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('Biometric Status',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w700,
-                color: AppColors.textPrimary,
-              )),
-          const SizedBox(height: 16),
           _BiometricRow(
-            icon: Icons.face_retouching_natural,
-            label: 'Face Recognition',
+            icon: Icons.face,
+            label: 'Face ID',
             enrolled: _employee?.hasFaceEnrolled ?? false,
-            onEnroll: () => _showEnrollDialog('Face ID'),
+            onEnroll: () => _enroll('Face ID'),
+            onUnenroll: () => _unenroll('Face ID'),
           ),
-          const Divider(color: AppColors.cardBorder, height: 24),
+          Divider(color: theme.dividerColor),
           _BiometricRow(
-            icon: Icons.fingerprint_rounded,
+            icon: Icons.fingerprint,
             label: 'Fingerprint',
             enrolled: _employee?.hasFingerprintEnrolled ?? false,
-            onEnroll: () => _showEnrollDialog('Fingerprint'),
-          ),
-          const Divider(color: AppColors.cardBorder, height: 24),
-          _BiometricRow(
-            icon: Icons.pin_rounded,
-            label: 'PIN Code',
-            enrolled: _employee?.hasPinSet ?? false,
-            onEnroll: () => _showSetPinDialog(),
+            onEnroll: () => _enroll('Fingerprint'),
+            onUnenroll: () => _unenroll('Fingerprint'),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildSettings() {
+  Widget _buildSettings(
+      ThemeData theme, ColorScheme cs, ThemeNotifier themeNotifier) {
     return Container(
       decoration: BoxDecoration(
-        gradient: AppColors.gradientCard,
+        color: theme.cardColor,
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.cardBorder),
+        border: Border.all(color: theme.dividerColor),
       ),
-      child: Column(
-        children: [
-          _SettingTile(
-            icon: Icons.notifications_outlined,
-            label: 'Notifications',
-            trailing: Switch(
-              value: true,
-              onChanged: (_) {},
-              activeColor: AppColors.accent,
-            ),
-          ),
-          const Divider(color: AppColors.cardBorder, height: 1),
-          _SettingTile(
-            icon: Icons.fingerprint_rounded,
-            label: 'Biometric Login',
-            trailing: Switch(
-              value: _biometricEnabled,
-              onChanged: (v) => setState(() => _biometricEnabled = v),
-              activeColor: AppColors.accent,
-            ),
-          ),
-          const Divider(color: AppColors.cardBorder, height: 1),
-          _SettingTile(
-            icon: Icons.location_on_outlined,
-            label: 'Geo-fencing',
-            trailing: Switch(
-              value: true,
-              onChanged: (_) {},
-              activeColor: AppColors.accent,
-            ),
-          ),
-          const Divider(color: AppColors.cardBorder, height: 1),
-          _SettingTile(
-            icon: Icons.dark_mode_rounded,
-            label: 'Dark Mode',
-            trailing: Switch(
-              value: true,
-              onChanged: (_) {},
-              activeColor: AppColors.accent,
-            ),
-          ),
-        ],
+      child: _SettingTile(
+        icon: Icons.dark_mode,
+        label: 'Dark Mode',
+        trailing: Switch(
+          value: themeNotifier.isDark,
+          onChanged: (_) => themeNotifier.toggle(),
+          activeColor: AppColors.accent,
+        ),
       ),
     );
   }
 
-  Widget _buildSecuritySection() {
+  Widget _buildSecuritySection(ThemeData theme, ColorScheme cs) {
     return Container(
       decoration: BoxDecoration(
-        gradient: AppColors.gradientCard,
+        color: theme.cardColor,
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.cardBorder),
+        border: Border.all(color: theme.dividerColor),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Text('Security',
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w700,
-                  color: AppColors.textMuted,
-                  letterSpacing: 0.5,
-                )),
-          ),
-          _SettingTile(
-            icon: Icons.calendar_month_rounded,
-            label: 'My Attendance History',
-            onTap: () => Navigator.push(context,
-                MaterialPageRoute(builder: (_) => const AttendanceHistoryScreen())),
-          ),
-          const Divider(color: AppColors.cardBorder, height: 1),
-          _SettingTile(
-            icon: Icons.history_rounded,
-            label: 'Audit Log',
-            onTap: () {},
-          ),
-          const Divider(color: AppColors.cardBorder, height: 1),
-          _SettingTile(
-            icon: Icons.devices_rounded,
-            label: 'Trusted Devices',
-            onTap: () {},
-          ),
-          const Divider(color: AppColors.cardBorder, height: 1),
-          _SettingTile(
-            icon: Icons.lock_reset_rounded,
-            label: 'Change PIN',
-            onTap: _showSetPinDialog,
-          ),
-          const Divider(color: AppColors.cardBorder, height: 1),
-          _SettingTile(
-            icon: Icons.info_outline_rounded,
-            label: 'App Version',
-            trailing: const Text('v1.0.0',
-                style: TextStyle(fontSize: 13, color: AppColors.textMuted)),
-          ),
-        ],
+      child: _SettingTile(
+        icon: Icons.history,
+        label: 'Attendance History',
+        onTap: () => Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const AttendanceHistoryScreen()),
+        ),
       ),
     );
   }
 
   Widget _buildLogout() {
-    return GestureDetector(
-      onTap: () => showDialog(
-        context: context,
-        builder: (_) => AlertDialog(
-          backgroundColor: AppColors.card,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: const Text('Sign Out',
-              style: TextStyle(color: AppColors.textPrimary, fontWeight: FontWeight.w700)),
-          content: const Text('Are you sure you want to sign out?',
-              style: TextStyle(color: AppColors.textSecondary)),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Cancel', style: TextStyle(color: AppColors.textSecondary))),
-            TextButton(
-                onPressed: _logout,
-                child: const Text('Sign Out', style: TextStyle(color: AppColors.error))),
-          ],
+    return SizedBox(
+      width: double.infinity,
+      child: ElevatedButton.icon(
+        onPressed: _logout,
+        icon: const Icon(Icons.logout),
+        label: const Text('Logout Account'),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: AppColors.error.withOpacity(0.1),
+          foregroundColor: AppColors.error,
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16)),
+          side: BorderSide(color: AppColors.error.withOpacity(0.2)),
+          elevation: 0,
         ),
-      ),
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: AppColors.error.withOpacity(0.08),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: AppColors.error.withOpacity(0.3)),
-        ),
-        child: const Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.logout_rounded, color: AppColors.error, size: 20),
-            SizedBox(width: 10),
-            Text('Sign Out',
-                style: TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
-                  color: AppColors.error,
-                )),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _showEnrollDialog(String type) {
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: AppColors.card,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Text('Enroll $type',
-            style: const TextStyle(color: AppColors.textPrimary, fontWeight: FontWeight.w700)),
-        content: Text('Follow the prompts to enroll your $type biometric.',
-            style: const TextStyle(color: AppColors.textSecondary)),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel', style: TextStyle(color: AppColors.textSecondary))),
-          ElevatedButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Start')),
-        ],
-      ),
-    );
-  }
-
-  void _showSetPinDialog() {
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: AppColors.card,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text('Set PIN',
-            style: TextStyle(color: AppColors.textPrimary, fontWeight: FontWeight.w700)),
-        content: const Text('Choose a 4-digit PIN for quick authentication.',
-            style: TextStyle(color: AppColors.textSecondary)),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel', style: TextStyle(color: AppColors.textSecondary))),
-          ElevatedButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Set PIN')),
-        ],
       ),
     );
   }
@@ -412,45 +473,49 @@ class _BiometricRow extends StatelessWidget {
   final IconData icon;
   final String label;
   final bool enrolled;
-  final VoidCallback onEnroll;
-  const _BiometricRow({required this.icon, required this.label,
-    required this.enrolled, required this.onEnroll});
+  final VoidCallback onEnroll, onUnenroll;
+
+  const _BiometricRow({
+    required this.icon,
+    required this.label,
+    required this.enrolled,
+    required this.onEnroll,
+    required this.onUnenroll,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Icon(icon,
-            color: enrolled ? AppColors.success : AppColors.textMuted, size: 24),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(label,
-                  style: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
-                    color: AppColors.textPrimary,
-                  )),
-              Text(enrolled ? 'Enrolled ✓' : 'Not enrolled',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: enrolled ? AppColors.success : AppColors.textMuted,
-                  )),
-            ],
+    final cs = Theme.of(context).colorScheme;
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(
+        icon,
+        color: enrolled ? AppColors.success : cs.onSurface.withOpacity(0.4),
+      ),
+      title: Text(
+        label,
+        style: TextStyle(
+            color: cs.onSurface, fontWeight: FontWeight.w500),
+      ),
+      subtitle: Text(
+        enrolled ? 'Enrolled' : 'Not setup',
+        style: TextStyle(
+          color: enrolled
+              ? AppColors.success
+              : cs.onSurface.withOpacity(0.4),
+          fontSize: 12,
+        ),
+      ),
+      trailing: TextButton(
+        onPressed: enrolled ? onUnenroll : onEnroll,
+        child: Text(
+          enrolled ? 'Remove' : 'Setup',
+          style: TextStyle(
+            color: enrolled ? AppColors.error : AppColors.accent,
+            fontWeight: FontWeight.bold,
           ),
         ),
-        TextButton(
-          onPressed: onEnroll,
-          child: Text(enrolled ? 'Update' : 'Enroll',
-              style: TextStyle(
-                color: enrolled ? AppColors.textSecondary : AppColors.accent,
-                fontWeight: FontWeight.w600,
-                fontSize: 13,
-              )),
-        ),
-      ],
+      ),
     );
   }
 }
@@ -460,24 +525,23 @@ class _SettingTile extends StatelessWidget {
   final String label;
   final Widget? trailing;
   final VoidCallback? onTap;
-  const _SettingTile({required this.icon, required this.label, this.trailing, this.onTap});
+
+  const _SettingTile({
+    required this.icon,
+    required this.label,
+    this.trailing,
+    this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
     return ListTile(
-      onTap: onTap,
-      leading: Icon(icon, color: AppColors.textSecondary, size: 22),
-      title: Text(label,
-          style: const TextStyle(
-            fontSize: 15,
-            color: AppColors.textPrimary,
-            fontWeight: FontWeight.w500,
-          )),
+      leading: Icon(icon, color: cs.onSurface.withOpacity(0.6)),
+      title: Text(label, style: TextStyle(color: cs.onSurface)),
       trailing: trailing ??
-          (onTap != null
-              ? const Icon(Icons.chevron_right_rounded,
-              color: AppColors.textMuted)
-              : null),
+          Icon(Icons.chevron_right, color: cs.onSurface.withOpacity(0.4)),
+      onTap: onTap,
     );
   }
 }

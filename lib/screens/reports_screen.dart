@@ -25,6 +25,7 @@ class _ReportsScreenState extends State<ReportsScreen>
   List<FlSpot> _trendSpots = [];
   bool _loading = true;
   Employee? _employee;
+  double _totalEarned = 0.0;
 
   @override
   void initState() {
@@ -41,6 +42,7 @@ class _ReportsScreenState extends State<ReportsScreen>
     final employee = await DatabaseService.instance.getEmployeeById(empId);
     final stats = await DatabaseService.instance.getAttendanceStats(empId);
     final history = await DatabaseService.instance.getAttendanceByEmployee(empId, limit: 10);
+    final payroll = await DatabaseService.instance.getPayrollSummary(empId, days: 15);
     
     List<FlSpot> spots = [];
     for (int i = 0; i < history.length; i++) {
@@ -53,6 +55,7 @@ class _ReportsScreenState extends State<ReportsScreen>
     if (mounted) {
       setState(() {
         _employee = employee;
+        _totalEarned = payroll['grossPay'] ?? 0.0;
         _stats = {
           'present': stats['present'] ?? 0,
           'late': stats['late'] ?? 0,
@@ -221,9 +224,9 @@ class _ReportsScreenState extends State<ReportsScreen>
             child: Container(
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                color: f.color.withValues(alpha: 0.08),
+                color: f.color.withOpacity(0.08),
                 borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: f.color.withValues(alpha: 0.3)),
+                border: Border.all(color: f.color.withOpacity(0.3)),
               ),
               child: Row(
                 children: [
@@ -251,7 +254,7 @@ class _ReportsScreenState extends State<ReportsScreen>
       backgroundColor: AppColors.surface,
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
-      builder: (_) => _ExportPreviewSheet(format: f, employee: _employee, range: _ranges[_selectedRange]),
+      builder: (_) => _ExportPreviewSheet(format: f, employee: _employee, range: _ranges[_selectedRange], totalEarned: _totalEarned),
     );
   }
 }
@@ -260,7 +263,8 @@ class _ExportPreviewSheet extends StatefulWidget {
   final _ExportFormat format;
   final Employee? employee;
   final String range;
-  const _ExportPreviewSheet({required this.format, this.employee, required this.range});
+  final double totalEarned;
+  const _ExportPreviewSheet({required this.format, this.employee, required this.range, required this.totalEarned});
 
   @override
   State<_ExportPreviewSheet> createState() => _ExportPreviewSheetState();
@@ -271,17 +275,29 @@ class _ExportPreviewSheetState extends State<_ExportPreviewSheet> {
 
   Future<void> _handleExport() async {
     setState(() => _exporting = true);
+    
+    // Simulate real database extraction including the "money" (earnings) data
+    if (widget.employee != null) {
+      final payroll = await DatabaseService.instance.getPayrollSummary(widget.employee!.id, days: 15);
+      await DatabaseService.instance.savePayrollExportFile(widget.employee!, payroll);
+    }
+    
     await Future.delayed(const Duration(seconds: 2));
+    
     if (mounted) {
       Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${widget.format.label} exported to Downloads ✓'), backgroundColor: AppColors.success),
+        SnackBar(
+          content: Text('${widget.format.label} with Total Earnings (₱${widget.totalEarned.toStringAsFixed(2)}) exported ✓'), 
+          backgroundColor: AppColors.success
+        ),
       );
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final fmt = NumberFormat.currency(symbol: '₱');
     return Padding(
       padding: const EdgeInsets.all(24),
       child: Column(
@@ -297,12 +313,12 @@ class _ExportPreviewSheetState extends State<_ExportPreviewSheet> {
           _previewInfo('FILE TYPE', widget.format.label),
           _previewInfo('REPORT RANGE', widget.range.toUpperCase()),
           _previewInfo('EMPLOYEE NAME', widget.employee?.fullName ?? 'N/A'),
-          _previewInfo('EMPLOYEE ID', widget.employee?.employeeId ?? 'N/A'),
-          _previewInfo('TOTAL RECORDS', 'Real-time database extraction active'),
+          _previewInfo('TOTAL EARNINGS', fmt.format(widget.totalEarned)),
+          _previewInfo('DATA FIELDS', 'Date, Time In, Time Out, Hours, Earnings (₱)'),
           const SizedBox(height: 24),
           const Divider(color: AppColors.cardBorder),
           const SizedBox(height: 12),
-          const Text('Document generated includes all attendance logs, timestamps, and geolocation metadata.', 
+          const Text('The exported file will include a detailed breakdown of daily hours and calculated salary for this period.', 
             style: TextStyle(fontSize: 12, color: AppColors.textSecondary, height: 1.5)),
           const SizedBox(height: 24),
           SizedBox(
@@ -313,7 +329,7 @@ class _ExportPreviewSheetState extends State<_ExportPreviewSheet> {
               style: ElevatedButton.styleFrom(backgroundColor: widget.format.color, foregroundColor: Colors.white),
               child: _exporting 
                 ? const CircularProgressIndicator(color: Colors.white)
-                : Text('Confirm & Export ${widget.format.label.split(' ')[0]}'),
+                : Text('Confirm & Download ${widget.format.label.split(' ')[0]}'),
             ),
           ),
           const SizedBox(height: 12),
@@ -346,7 +362,7 @@ class _SummaryCard extends StatelessWidget {
     return Expanded(
       child: Container(
         padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(color: color.withValues(alpha: 0.08), borderRadius: BorderRadius.circular(16), border: Border.all(color: color.withValues(alpha: 0.2))),
+        decoration: BoxDecoration(color: color.withOpacity(0.08), borderRadius: BorderRadius.circular(16), border: Border.all(color: color.withOpacity(0.2))),
         child: Row(
           children: [
             Icon(icon, color: color, size: 24),
@@ -395,7 +411,7 @@ class _TrendChart extends StatelessWidget {
                     isCurved: true,
                     color: AppColors.accent,
                     barWidth: 2.5,
-                    belowBarData: BarAreaData(show: true, gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [AppColors.accent.withValues(alpha: 0.3), AppColors.accent.withValues(alpha: 0.0)])),
+                    belowBarData: BarAreaData(show: true, gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [AppColors.accent.withOpacity(0.3), AppColors.accent.withOpacity(0.0)])),
                     dotData: FlDotData(show: true, getDotPainter: (_, __, ___, ____) => FlDotCirclePainter(radius: 4, color: AppColors.accent, strokeWidth: 2, strokeColor: AppColors.primary)),
                   ),
                 ],
@@ -436,7 +452,7 @@ class _DepartmentRow extends StatelessWidget {
           const SizedBox(height: 8),
           LinearProgressIndicator(
             value: data.rate,
-            backgroundColor: data.color.withValues(alpha: 0.1),
+            backgroundColor: data.color.withOpacity(0.1),
             valueColor: AlwaysStoppedAnimation<Color>(data.color),
             borderRadius: BorderRadius.circular(4),
             minHeight: 8,
