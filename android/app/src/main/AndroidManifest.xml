@@ -14,8 +14,12 @@
     <!-- ─── Location for Geofencing ──────────────────────────────────────── -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <!-- Background location only needed if monitoring when app is closed -->
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!-- ─── Background Service Permissions ───────────────────────────────── -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- ─── Network ──────────────────────────────────────────────────────── -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -29,8 +33,8 @@
 
     <!-- ─── Vibration ────────────────────────────────────────────────────── -->
     <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
-    <!-- ─── NFC ── FIXED: required="false" so app works on non-NFC devices ─ -->
+
+    <!-- ─── NFC ──────────────────────────────────────────────────────────── -->
     <uses-permission android:name="android.permission.NFC" />
     <uses-feature
         android:name="android.hardware.nfc"
@@ -50,6 +54,11 @@
         android:requestLegacyExternalStorage="true"
         tools:targetApi="31">
 
+        <!-- ─── Background Service Declaration ────────────────────────── -->
+        <service
+            android:name="id.flutter.flutter_background_service.BackgroundService"
+            android:foregroundServiceType="location" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -64,14 +73,11 @@
                 android:name="io.flutter.embedding.android.NormalTheme"
                 android:resource="@style/NormalTheme" />
 
-            <!-- ── Main launcher intent ────────────────────────────────── -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- ── NFC Tag Discovered intents ─────────────────────────── -->
-            <!-- Required so NFC tags wake/open the app -->
             <intent-filter>
                 <action android:name="android.nfc.action.NDEF_DISCOVERED" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -87,14 +93,12 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
 
-            <!-- ── NFC Tech list for MIFARE Classic keyfobs ───────────── -->
             <meta-data
                 android:name="android.nfc.action.TECH_DISCOVERED"
                 android:resource="@xml/nfc_tech_filter" />
 
         </activity>
 
-        <!-- Flutter embedding -->
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />

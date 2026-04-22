@@ -1,0 +1,2 @@
+admin flutter run -d chrome --dart-define=page=admin
+user flutter run -d chrome --dart-define=page=landing

@@ -1,6 +1,7 @@
 // lib/screens/attendance_history_screen.dart
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:intl/intl.dart';
 import '../theme/app_theme.dart';
 import '../services/database_service.dart';
@@ -11,7 +12,8 @@ import '../models/attendance.dart';
 import '../models/employee.dart';
 
 class AttendanceHistoryScreen extends StatefulWidget {
-  const AttendanceHistoryScreen({super.key});
+  final Employee? initialEmployee;
+  const AttendanceHistoryScreen({super.key, this.initialEmployee});
   @override
   State<AttendanceHistoryScreen> createState() =>
       _AttendanceHistoryScreenState();
@@ -31,27 +33,28 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
   void initState() {
     super.initState();
     
-    _syncSub = SyncService.instance.events.listen((e) async {
-      if (!mounted) return;
-      setState(() => _pendingCount = e.pendingCount);
-      if (e.type == SyncEventType.syncDone) {
-        await _loadData();
-        if (e.syncedCount > 0)
-          _snack('✓ ${e.syncedCount} record(s) synced', AppColors.success);
-      }
-    });
+    if (!kIsWeb) {
+      _syncSub = SyncService.instance.events.listen((e) async {
+        if (!mounted) return;
+        setState(() => _pendingCount = e.pendingCount);
+        if (e.type == SyncEventType.syncDone) {
+          await _loadData();
+          if (e.syncedCount > 0)
+            _snack('✓ ${e.syncedCount} record(s) synced', AppColors.success);
+        }
+      });
 
-    _connectSub = ConnectivityService.instance.onStatusChange.listen((online) {
-      if (mounted && online) _sync();
-    });
+      _connectSub = ConnectivityService.instance.onStatusChange.listen((online) {
+        if (mounted && online) _sync();
+      });
 
-    // Refresh history when NFC attendance occurs
-    _attendanceSub = DatabaseService.instance.onAttendanceChanged.listen((_) {
-      if (mounted) _loadData();
-    });
+      _attendanceSub = DatabaseService.instance.onAttendanceChanged.listen((_) {
+        if (mounted) _loadData();
+      });
+    }
 
     _loadData();
-    _sync();
+    if (!kIsWeb) _sync();
   }
 
   @override
@@ -64,12 +67,18 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
 
   Future<void> _loadData() async {
     final empId = await SecurityService.instance.getCurrentEmployeeId();
-    if (empId == null) return;
-    final emp = await DatabaseService.instance.getEmployeeById(empId);
-    final records =
-    await DatabaseService.instance.getAttendanceByEmployee(empId, limit: 90);
-    final pending = await SyncService.instance.getPendingCount();
-    if (mounted)
+    
+    Employee? emp = widget.initialEmployee;
+    List<Attendance> records = [];
+    int pending = 0;
+
+    if (empId != null && !kIsWeb) {
+      emp = await DatabaseService.instance.getEmployeeById(empId);
+      records = await DatabaseService.instance.getAttendanceByEmployee(empId, limit: 90);
+      pending = await SyncService.instance.getPendingCount();
+    }
+
+    if (mounted) {
       setState(() {
         _employee = emp;
         _records = records;
@@ -77,10 +86,11 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
         _loading = false;
         _syncing = false;
       });
+    }
   }
 
   Future<void> _sync() async {
-    if (_syncing) return;
+    if (kIsWeb || _syncing) return;
     if (mounted) setState(() => _syncing = true);
     await DatabaseService.instance.syncLocalFilesToDatabase();
     await SyncService.instance.syncPending();
@@ -101,8 +111,11 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
 
   Map<String, List<Attendance>> get _grouped {
     final m = <String, List<Attendance>>{};
-    for (final r in _records)
-      m.putIfAbsent(r.date.substring(0, 7), () => []).add(r);
+    for (final r in _records) {
+      if (r.date.length >= 7) {
+        m.putIfAbsent(r.date.substring(0, 7), () => []).add(r);
+      }
+    }
     return m;
   }
 
@@ -113,7 +126,7 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
       appBar: AppBar(
         backgroundColor: AppColors.primary,
         elevation: 0,
-        leading: IconButton(
+        leading: kIsWeb ? null : IconButton(
           icon: const Icon(Icons.arrow_back_rounded, color: AppColors.textPrimary),
           onPressed: () => Navigator.pop(context),
         ),
@@ -126,15 +139,15 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
                 style: const TextStyle(fontSize: 11, color: AppColors.textSecondary)),
         ]),
         actions: [
-          if (_pendingCount > 0)
+          if (!kIsWeb && _pendingCount > 0)
             Center(
               child: Container(
                 margin: const EdgeInsets.only(right: 4),
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                 decoration: BoxDecoration(
-                  color: AppColors.warning.withOpacity(0.15),
+                  color: AppColors.warning.withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: AppColors.warning.withOpacity(0.4)),
+                  border: Border.all(color: AppColors.warning.withValues(alpha: 0.4)),
                 ),
                 child: Row(mainAxisSize: MainAxisSize.min, children: [
                   const Icon(Icons.cloud_upload_outlined,
@@ -146,15 +159,16 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
                 ]),
               ),
             ),
-          IconButton(
-            tooltip: 'Sync now',
-            icon: _syncing
-                ? const SizedBox(width: 18, height: 18,
-                child: CircularProgressIndicator(
-                    color: AppColors.accent, strokeWidth: 2))
-                : const Icon(Icons.sync_rounded, color: AppColors.accent),
-            onPressed: _syncing ? null : _sync,
-          ),
+          if (!kIsWeb)
+            IconButton(
+              tooltip: 'Sync now',
+              icon: _syncing
+                  ? const SizedBox(width: 18, height: 18,
+                  child: CircularProgressIndicator(
+                      color: AppColors.accent, strokeWidth: 2))
+                  : const Icon(Icons.sync_rounded, color: AppColors.accent),
+              onPressed: _syncing ? null : _sync,
+            ),
         ],
       ),
       body: _loading
@@ -164,9 +178,9 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
           : RefreshIndicator(
         color: AppColors.accent,
         backgroundColor: AppColors.card,
-        onRefresh: _sync,
+        onRefresh: kIsWeb ? () async {} : _sync,
         child: CustomScrollView(slivers: [
-          SliverToBoxAdapter(child: _buildSyncBar()),
+          if (!kIsWeb) SliverToBoxAdapter(child: _buildSyncBar()),
           SliverToBoxAdapter(child: _buildTodayCard()),
           ..._grouped.entries.map((e) =>
               _buildMonthSection(e.key, e.value)),
@@ -183,13 +197,13 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
         color: online
-            ? AppColors.success.withOpacity(0.07)
-            : AppColors.warning.withOpacity(0.07),
+            ? AppColors.success.withValues(alpha: 0.07)
+            : AppColors.warning.withValues(alpha: 0.07),
         borderRadius: BorderRadius.circular(10),
         border: Border.all(
             color: online
-                ? AppColors.success.withOpacity(0.2)
-                : AppColors.warning.withOpacity(0.2)),
+                ? AppColors.success.withValues(alpha: 0.2)
+                : AppColors.warning.withValues(alpha: 0.2)),
       ),
       child: Row(children: [
         Icon(online ? Icons.cloud_done_rounded : Icons.cloud_off_rounded,
@@ -222,12 +236,12 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
         gradient: LinearGradient(
-          colors: [AppColors.accent.withOpacity(0.15),
-            AppColors.accentSecondary.withOpacity(0.08)],
+          colors: [AppColors.accent.withValues(alpha: 0.15),
+            AppColors.accentSecondary.withValues(alpha: 0.08)],
           begin: Alignment.topLeft, end: Alignment.bottomRight,
         ),
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.accent.withOpacity(0.3)),
+        border: Border.all(color: AppColors.accent.withValues(alpha: 0.3)),
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
@@ -240,10 +254,10 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
         ]),
         const SizedBox(height: 14),
         if (today == null)
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 8),
-            child: Text('No attendance recorded yet today',
-                style: TextStyle(fontSize: 13, color: AppColors.textMuted)),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text(kIsWeb ? 'Attendance tracking limited on Web' : 'No attendance recorded yet today',
+                style: const TextStyle(fontSize: 13, color: AppColors.textMuted)),
           )
         else ...[
           Row(children: [
@@ -284,8 +298,10 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
 
   SliverToBoxAdapter _buildMonthSection(
       String monthKey, List<Attendance> records) {
-    final label =
-    DateFormat('MMMM yyyy').format(DateTime.parse('$monthKey-01'));
+    DateTime? dt;
+    try { dt = DateTime.parse('$monthKey-01'); } catch(_) {}
+    final label = dt != null ? DateFormat('MMMM yyyy').format(dt) : monthKey;
+
     return SliverToBoxAdapter(
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Padding(
@@ -298,7 +314,7 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
               decoration: BoxDecoration(
-                  color: AppColors.accent.withOpacity(0.1),
+                  color: AppColors.accent.withValues(alpha: 0.1),
                   borderRadius: BorderRadius.circular(6)),
               child: Text('${records.length} days',
                   style: const TextStyle(fontSize: 9,
@@ -326,7 +342,7 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
             color: isToday
-                ? AppColors.accent.withOpacity(0.4)
+                ? AppColors.accent.withValues(alpha: 0.4)
                 : AppColors.cardBorder,
             width: isToday ? 1.5 : 1,
           ),
@@ -337,7 +353,7 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
             padding: const EdgeInsets.symmetric(vertical: 8),
             decoration: BoxDecoration(
               color: isToday
-                  ? AppColors.accent.withOpacity(0.12)
+                  ? AppColors.accent.withValues(alpha: 0.12)
                   : AppColors.surfaceLight,
               borderRadius: BorderRadius.circular(10),
             ),
@@ -397,7 +413,7 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
               decoration: BoxDecoration(
-                  color: statusColor.withOpacity(0.12),
+                  color: statusColor.withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(7)),
               child: Text(r.status.label.toUpperCase(),
                   style: TextStyle(fontSize: 8, color: statusColor,
@@ -428,22 +444,24 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
       child: Column(mainAxisSize: MainAxisSize.min, children: [
         const Icon(Icons.history_rounded, color: AppColors.textMuted, size: 64),
         const SizedBox(height: 16),
-        const Text('No records yet',
-            style: TextStyle(fontSize: 16, color: AppColors.textMuted)),
+        Text(kIsWeb ? 'Attendance History not available on Web' : 'No records yet',
+            style: const TextStyle(fontSize: 16, color: AppColors.textMuted)),
         const SizedBox(height: 8),
-        const Text('Clock in to start tracking your attendance',
-            style: TextStyle(fontSize: 13, color: AppColors.textMuted)),
-        const SizedBox(height: 24),
-        ElevatedButton.icon(
-          onPressed: _sync,
-          style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.accent,
-              foregroundColor: AppColors.primary,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12))),
-          icon: const Icon(Icons.sync_rounded, size: 16),
-          label: const Text('Sync Records'),
-        ),
+        Text(kIsWeb ? 'Please use the mobile app to view detailed history' : 'Clock in to start tracking your attendance',
+            style: const TextStyle(fontSize: 13, color: AppColors.textMuted)),
+        if (!kIsWeb) ...[
+          const SizedBox(height: 24),
+          ElevatedButton.icon(
+            onPressed: _sync,
+            style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.accent,
+                foregroundColor: AppColors.primary,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12))),
+            icon: const Icon(Icons.sync_rounded, size: 16),
+            label: const Text('Sync Records'),
+          ),
+        ]
       ]),
     );
   }
@@ -510,7 +528,7 @@ class _DetailSheet extends StatelessWidget {
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
           decoration: BoxDecoration(
-              color: _sc(record.status).withOpacity(0.12),
+              color: _sc(record.status).withValues(alpha: 0.12),
               borderRadius: BorderRadius.circular(10)),
           child: Text(record.status.label,
               style: TextStyle(fontSize: 12, color: _sc(record.status),
@@ -594,7 +612,7 @@ class _Row extends StatelessWidget {
       Container(
         width: 36, height: 36,
         decoration: BoxDecoration(
-            color: iconColor.withOpacity(0.12), shape: BoxShape.circle),
+            color: iconColor.withValues(alpha: 0.12), shape: BoxShape.circle),
         child: Icon(icon, color: iconColor, size: 18),
       ),
       const SizedBox(width: 12),
@@ -630,9 +648,9 @@ class _BigStampBlock extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.08),
+        color: color.withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: color.withOpacity(0.25)),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
@@ -676,10 +694,10 @@ class _StampPill extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
-        color: time != null ? color.withOpacity(0.1) : AppColors.surfaceLight,
+        color: time != null ? color.withValues(alpha: 0.1) : AppColors.surfaceLight,
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
-            color: time != null ? color.withOpacity(0.3) : AppColors.cardBorder),
+            color: time != null ? color.withValues(alpha: 0.3) : AppColors.cardBorder),
       ),
       child: Row(mainAxisSize: MainAxisSize.min, children: [
         Text('$label ',

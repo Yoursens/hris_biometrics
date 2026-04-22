@@ -16,7 +16,8 @@ import 'landing_screen.dart';
 import 'attendance_history_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
-  const ProfileScreen({super.key});
+  final Employee? initialEmployee;
+  const ProfileScreen({super.key, this.initialEmployee});
 
   @override
   State<ProfileScreen> createState() => _ProfileScreenState();
@@ -26,6 +27,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Employee? _employee;
   bool _loading = true;
   bool _isSyncing = false;
+  bool _isDeleting = false;
   final _localAuth = LocalAuthentication();
 
   @override
@@ -35,9 +37,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _load() async {
-    final empId =
-        await SecurityService.instance.getCurrentEmployeeId() ?? 'emp_001';
-    final employee = await DatabaseService.instance.getEmployeeById(empId);
+    final empId = await SecurityService.instance.getCurrentEmployeeId();
+    
+    Employee? employee;
+    if (empId != null) {
+      employee = await DatabaseService.instance.getEmployeeById(empId);
+    }
+    
+    // Use passed-in employee as fallback (especially for Web)
+    employee ??= widget.initialEmployee;
+
     if (mounted) {
       setState(() {
         _employee = employee;
@@ -47,7 +56,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _logout() async {
-    await AuthService.instance.signOut();
+    await AuthService.instance.signOut(employee: _employee);
     await SecurityService.instance.clearSession();
     if (!mounted) return;
     Navigator.pushAndRemoveUntil(
@@ -55,6 +64,63 @@ class _ProfileScreenState extends State<ProfileScreen> {
       MaterialPageRoute(builder: (_) => const LandingScreen()),
           (_) => false,
     );
+  }
+
+  Future<void> _confirmDeleteAccount() async {
+    if (_employee == null) return;
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.card,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: AppColors.error),
+            SizedBox(width: 10),
+            Text('Delete Account', style: TextStyle(color: AppColors.textPrimary)),
+          ],
+        ),
+        content: const Text(
+          'Are you sure you want to permanently delete your account? This action will remove all your data from the local database, cloud storage, and admin records. This cannot be undone.',
+          style: TextStyle(color: AppColors.textSecondary, fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel', style: TextStyle(color: AppColors.textMuted)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.error),
+            child: const Text('Delete Permanently', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      setState(() => _isDeleting = true);
+      try {
+        await AuthService.instance.deleteAccount(_employee!);
+        await SecurityService.instance.clearSession();
+        if (mounted) {
+          Navigator.pushAndRemoveUntil(
+            context,
+            MaterialPageRoute(builder: (_) => const LandingScreen()),
+                (_) => false,
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Error deleting account: $e'), backgroundColor: AppColors.error),
+          );
+        }
+      } finally {
+        if (mounted) setState(() => _isDeleting = false);
+      }
+    }
   }
 
   Future<void> _syncToFirebase() async {
@@ -244,11 +310,20 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final cs = theme.colorScheme;
     final isDark = theme.brightness == Brightness.dark;
 
-    if (_loading) {
+    if (_loading || _isDeleting) {
       return Scaffold(
         backgroundColor: theme.scaffoldBackgroundColor,
         body: Center(
-            child: CircularProgressIndicator(color: cs.primary)),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(color: cs.primary),
+                if (_isDeleting) ...[
+                  const SizedBox(height: 20),
+                  const Text('Deleting account data...', style: TextStyle(color: AppColors.textSecondary)),
+                ]
+              ],
+            )),
       );
     }
 
@@ -258,23 +333,34 @@ class _ProfileScreenState extends State<ProfileScreen> {
       backgroundColor: theme.scaffoldBackgroundColor,
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(20, 20, 20, 120), // Added bottom padding for navbar clearance
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 120), 
           child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               _buildProfileCard(theme, cs, isDark),
-              const SizedBox(height: 20),
+              const SizedBox(height: 30),
               
-              _buildSyncSection(theme, cs),
-              const SizedBox(height: 20),
-
-              _buildBiometricStatus(theme, cs),
-              const SizedBox(height: 20),
+              const Text('PREFERENCES', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1, color: AppColors.textMuted)),
+              const SizedBox(height: 10),
               _buildSettings(theme, cs, themeNotifier),
-              const SizedBox(height: 20),
-              _buildSecuritySection(theme, cs),
-              const SizedBox(height: 20),
+              const SizedBox(height: 24),
+
+              const Text('ACCOUNT SECURITY', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1, color: AppColors.textMuted)),
+              const SizedBox(height: 10),
+              _buildBiometricStatus(theme, cs),
+              const SizedBox(height: 24),
+              
+              const Text('DATA & BACKUP', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1, color: AppColors.textMuted)),
+              const SizedBox(height: 10),
+              _buildSyncSection(theme, cs),
+              const SizedBox(height: 24),
+
+              const Text('DANGER ZONE', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1, color: AppColors.error)),
+              const SizedBox(height: 10),
+              _buildDangerZone(theme, cs),
+              
+              const SizedBox(height: 40),
               _buildLogout(),
-              // Additional safety space
               const SizedBox(height: 20),
             ],
           ),
@@ -327,12 +413,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ),
                 Text(
                   _employee?.position ?? 'Position',
-                  style: TextStyle(color: cs.onSurface.withOpacity(0.6)),
+                  style: TextStyle(color: cs.onSurface.withValues(alpha: 0.6)),
                 ),
                 const SizedBox(height: 4),
                 Text(
                   _employee?.email ?? '',
-                  style: TextStyle(color: cs.onSurface.withOpacity(0.4), fontSize: 12),
+                  style: TextStyle(color: cs.onSurface.withValues(alpha: 0.4), fontSize: 12),
                 ),
               ],
             ),
@@ -344,36 +430,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   Widget _buildSyncSection(ThemeData theme, ColorScheme cs) {
     return Container(
-      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: AppColors.accent.withOpacity(0.05),
+        color: theme.cardColor,
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.accent.withOpacity(0.2)),
+        border: Border.all(color: theme.dividerColor),
       ),
-      child: Row(
+      child: Column(
         children: [
-          const Icon(Icons.cloud_sync_rounded, color: AppColors.accent, size: 24),
-          const SizedBox(width: 12),
-          const Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Cloud Backup', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                Text('Backup your profile to Firebase', style: TextStyle(fontSize: 11, color: Colors.grey)),
-              ],
-            ),
-          ),
-          ElevatedButton(
-            onPressed: _isSyncing ? null : _syncToFirebase,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.accent,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-            ),
-            child: _isSyncing 
-              ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-              : const Text('Sync Now', style: TextStyle(fontSize: 12)),
+          ListTile(
+            leading: const Icon(Icons.cloud_sync_rounded, color: AppColors.accent),
+            title: const Text('Cloud Backup'),
+            subtitle: const Text('Sync your profile to Firebase', style: TextStyle(fontSize: 12)),
+            trailing: _isSyncing 
+              ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.accent))
+              : const Icon(Icons.chevron_right),
+            onTap: _isSyncing ? null : _syncToFirebase,
           ),
         ],
       ),
@@ -382,7 +453,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   Widget _buildBiometricStatus(ThemeData theme, ColorScheme cs) {
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.symmetric(vertical: 8),
       decoration: BoxDecoration(
         color: theme.cardColor,
         borderRadius: BorderRadius.circular(20),
@@ -392,18 +463,27 @@ class _ProfileScreenState extends State<ProfileScreen> {
         children: [
           _BiometricRow(
             icon: Icons.face,
-            label: 'Face ID',
+            label: 'Face ID Setup',
             enrolled: _employee?.hasFaceEnrolled ?? false,
             onEnroll: () => _enroll('Face ID'),
             onUnenroll: () => _unenroll('Face ID'),
           ),
-          Divider(color: theme.dividerColor),
+          Divider(color: theme.dividerColor, indent: 60),
           _BiometricRow(
             icon: Icons.fingerprint,
-            label: 'Fingerprint',
+            label: 'Fingerprint Setup',
             enrolled: _employee?.hasFingerprintEnrolled ?? false,
             onEnroll: () => _enroll('Fingerprint'),
             onUnenroll: () => _unenroll('Fingerprint'),
+          ),
+          Divider(color: theme.dividerColor, indent: 60),
+          _SettingTile(
+            icon: Icons.history,
+            label: 'Attendance History',
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => AttendanceHistoryScreen(initialEmployee: _employee)),
+            ),
           ),
         ],
       ),
@@ -419,31 +499,37 @@ class _ProfileScreenState extends State<ProfileScreen> {
         border: Border.all(color: theme.dividerColor),
       ),
       child: _SettingTile(
-        icon: Icons.dark_mode,
-        label: 'Dark Mode',
-        trailing: Switch(
-          value: themeNotifier.isDark,
-          onChanged: (_) => themeNotifier.toggle(),
-          activeColor: AppColors.accent,
+        icon: Icons.dark_mode_outlined,
+        label: 'App Theme',
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(themeNotifier.isDark ? 'Dark' : 'Light', style: TextStyle(color: cs.onSurface.withValues(alpha: 0.5), fontSize: 13)),
+            const SizedBox(width: 8),
+            Switch(
+              value: themeNotifier.isDark,
+              onChanged: (_) => themeNotifier.toggle(),
+              activeColor: AppColors.accent,
+            ),
+          ],
         ),
       ),
     );
   }
 
-  Widget _buildSecuritySection(ThemeData theme, ColorScheme cs) {
+  Widget _buildDangerZone(ThemeData theme, ColorScheme cs) {
     return Container(
       decoration: BoxDecoration(
         color: theme.cardColor,
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: theme.dividerColor),
+        border: Border.all(color: AppColors.error.withValues(alpha: 0.3)),
       ),
       child: _SettingTile(
-        icon: Icons.history,
-        label: 'Attendance History',
-        onTap: () => Navigator.push(
-          context,
-          MaterialPageRoute(builder: (_) => const AttendanceHistoryScreen()),
-        ),
+        icon: Icons.delete_forever_rounded,
+        label: 'Delete My Account',
+        labelColor: AppColors.error,
+        iconColor: AppColors.error,
+        onTap: _confirmDeleteAccount,
       ),
     );
   }
@@ -454,14 +540,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
       child: ElevatedButton.icon(
         onPressed: _logout,
         icon: const Icon(Icons.logout),
-        label: const Text('Logout Account'),
+        label: const Text('LOG OUT', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1)),
         style: ElevatedButton.styleFrom(
-          backgroundColor: AppColors.error.withOpacity(0.1),
+          backgroundColor: AppColors.card,
           foregroundColor: AppColors.error,
-          padding: const EdgeInsets.symmetric(vertical: 16),
+          padding: const EdgeInsets.symmetric(vertical: 18),
           shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16)),
-          side: BorderSide(color: AppColors.error.withOpacity(0.2)),
+              borderRadius: BorderRadius.circular(20)),
+          side: BorderSide(color: AppColors.error.withValues(alpha: 0.2)),
           elevation: 0,
         ),
       ),
@@ -487,10 +573,9 @@ class _BiometricRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return ListTile(
-      contentPadding: EdgeInsets.zero,
       leading: Icon(
         icon,
-        color: enrolled ? AppColors.success : cs.onSurface.withOpacity(0.4),
+        color: enrolled ? AppColors.success : cs.onSurface.withValues(alpha: 0.4),
       ),
       title: Text(
         label,
@@ -498,21 +583,29 @@ class _BiometricRow extends StatelessWidget {
             color: cs.onSurface, fontWeight: FontWeight.w500),
       ),
       subtitle: Text(
-        enrolled ? 'Enrolled' : 'Not setup',
+        enrolled ? 'Enabled' : 'Not configured',
         style: TextStyle(
           color: enrolled
               ? AppColors.success
-              : cs.onSurface.withOpacity(0.4),
-          fontSize: 12,
+              : cs.onSurface.withValues(alpha: 0.4),
+          fontSize: 11,
         ),
       ),
-      trailing: TextButton(
-        onPressed: enrolled ? onUnenroll : onEnroll,
-        child: Text(
-          enrolled ? 'Remove' : 'Setup',
-          style: TextStyle(
-            color: enrolled ? AppColors.error : AppColors.accent,
-            fontWeight: FontWeight.bold,
+      trailing: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: enrolled ? AppColors.error.withValues(alpha: 0.1) : AppColors.accent.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: InkWell(
+          onTap: enrolled ? onUnenroll : onEnroll,
+          child: Text(
+            enrolled ? 'Disable' : 'Set Up',
+            style: TextStyle(
+              color: enrolled ? AppColors.error : AppColors.accent,
+              fontWeight: FontWeight.bold,
+              fontSize: 12,
+            ),
           ),
         ),
       ),
@@ -525,22 +618,26 @@ class _SettingTile extends StatelessWidget {
   final String label;
   final Widget? trailing;
   final VoidCallback? onTap;
+  final Color? labelColor;
+  final Color? iconColor;
 
   const _SettingTile({
     required this.icon,
     required this.label,
     this.trailing,
     this.onTap,
+    this.labelColor,
+    this.iconColor,
   });
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return ListTile(
-      leading: Icon(icon, color: cs.onSurface.withOpacity(0.6)),
-      title: Text(label, style: TextStyle(color: cs.onSurface)),
+      leading: Icon(icon, color: iconColor ?? cs.onSurface.withValues(alpha: 0.6)),
+      title: Text(label, style: TextStyle(color: labelColor ?? cs.onSurface, fontWeight: FontWeight.w500)),
       trailing: trailing ??
-          Icon(Icons.chevron_right, color: cs.onSurface.withOpacity(0.4)),
+          Icon(Icons.chevron_right, color: cs.onSurface.withValues(alpha: 0.3), size: 18),
       onTap: onTap,
     );
   }

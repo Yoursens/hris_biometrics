@@ -23,10 +23,11 @@ class LocationTrackingService {
     _timer?.cancel();
     _updateLocation(employeeId);
     
-    _timer = Timer.periodic(const Duration(minutes: 5), (timer) {
+    // 🔥 UPDATED: Set timer for every 2 minutes
+    _timer = Timer.periodic(const Duration(minutes: 2), (timer) {
       _updateLocation(employeeId);
     });
-    debugPrint('📍 Location tracking started for: $employeeId');
+    debugPrint('📍 Location tracking started for: $employeeId (Every 2 minutes)');
   }
 
   void stopTracking() {

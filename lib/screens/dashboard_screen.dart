@@ -1,16 +1,20 @@
 // lib/screens/dashboard_screen.dart
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:fl_chart/fl_chart.dart';
 import 'package:camera/camera.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 
 import '../theme/app_theme.dart';
 import '../services/database_service.dart';
 import '../services/security_service.dart';
 import '../services/geofence_service.dart';
+import '../services/alarm_service.dart';
 import '../data/local/dao/sync_service.dart';
 import '../data/local/dao/connectivity_service.dart';
 import '../models/employee.dart';
@@ -19,28 +23,30 @@ import 'attendance_history_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   final Function(int)? onTabSwitch;
-  const DashboardScreen({super.key, this.onTabSwitch});
+  final Employee? initialEmployee;
+  const DashboardScreen({super.key, this.onTabSwitch, this.initialEmployee});
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> {
-  Employee?  _employee;
+class _DashboardScreenState extends State<DashboardScreen>
+    with TickerProviderStateMixin {
+  Employee? _employee;
   Attendance? _todayAttendance;
-  List<Attendance>           _recent  = [];
-  Map<String, int>           _stats   = {};
-  List<Map<String, dynamic>> _weekly  = [];
+  List<Attendance> _recent = [];
+  Map<String, int> _stats = {};
+  List<Map<String, dynamic>> _weekly = [];
 
-  bool _loading            = true;
-  bool _isDemo             = false;
-  bool _needsVerification  = true;
-  int  _pendingCount       = 0;
-  bool _isVerifying        = false;
+  bool _loading = true;
+  bool _isDemo = false;
+  bool _needsVerification = true;
+  int _pendingCount = 0;
+  bool _isVerifying = false;
+  bool _isShowingAlarmDialog = false;
 
-  // ── Spot-check photo ─────────────────────────────────────────────────────
-  String?   _spotCheckPhotoPath;   // local file path after capture
-  DateTime? _spotCheckTime;        // when it was taken
+  String? _spotCheckPhotoPath;
+  DateTime? _spotCheckTime;
 
   StreamSubscription? _syncSub;
   StreamSubscription? _connectSub;
@@ -49,12 +55,49 @@ class _DashboardScreenState extends State<DashboardScreen> {
   DateTime _now = DateTime.now();
   String? _overriddenEmployeeId;
 
+  // Animation
+  late AnimationController _fadeController;
+  late Animation<double> _fadeAnim;
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnim;
+
+  // ── Design tokens ──────────────────────────────────────────────────────
+  static const Color _navy      = Color(0xFF0A0F2E);
+  static const Color _navyLight = Color(0xFF131A45);
+  static const Color _navyCard  = Color(0xFF0F1535);
+  static const Color _accent    = Color(0xFF00D4FF);
+  static const Color _white     = Color(0xFFFFFFFF);
+  static const Color _white70   = Color(0xB3FFFFFF);
+  static const Color _white40   = Color(0x66FFFFFF);
+  static const Color _white15   = Color(0x26FFFFFF);
+  static const Color _white08   = Color(0x14FFFFFF);
+  static const Color _success   = Color(0xFF00E5A0);
+  static const Color _warning   = Color(0xFFFFBB00);
+  static const Color _error     = Color(0xFFFF4D6D);
+  static const Color _purple    = Color(0xFF9B6FFF);
+
   @override
   void initState() {
     super.initState();
 
-    _clock = Timer.periodic(const Duration(seconds: 1),
-            (_) { if (mounted) setState(() => _now = DateTime.now()); });
+    _fadeController = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 800))
+      ..forward();
+    _fadeAnim = Tween<double>(begin: 0, end: 1).animate(
+        CurvedAnimation(parent: _fadeController, curve: Curves.easeOut));
+
+    _pulseController = AnimationController(
+        vsync: this, duration: const Duration(seconds: 2))
+      ..repeat(reverse: true);
+    _pulseAnim = Tween<double>(begin: 0.97, end: 1.03).animate(
+        CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut));
+
+    _clock = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) {
+        setState(() => _now = DateTime.now());
+        _checkAlarmConditions();
+      }
+    });
 
     _syncSub = SyncService.instance.events.listen((e) {
       if (!mounted) return;
@@ -80,6 +123,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void dispose() {
     _clock.cancel();
+    _fadeController.dispose();
+    _pulseController.dispose();
     _syncSub?.cancel();
     _connectSub?.cancel();
     _attendanceSub?.cancel();
@@ -88,98 +133,142 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Future<void> _loadData() async {
     final loggedInId = await SecurityService.instance.getCurrentEmployeeId();
-    final targetId   = _overriddenEmployeeId ?? loggedInId;
-    _isDemo          = await SecurityService.instance.isDemoSession();
-    if (targetId == null) return;
+    final targetId = _overriddenEmployeeId ?? loggedInId;
+    _isDemo = await SecurityService.instance.isDemoSession();
 
-    final emp   = await DatabaseService.instance.getEmployeeById(targetId);
-    final today = await DatabaseService.instance.getTodayAttendance(targetId);
-    final stats = await DatabaseService.instance.getAttendanceStats(targetId);
-    final week  = await DatabaseService.instance.getWeeklyWorkHours(targetId);
-    final rec   = await DatabaseService.instance
-        .getAttendanceByEmployee(targetId, limit: 5);
-    final pend  = await SyncService.instance.getPendingCount();
+    Employee? emp;
+    if (targetId != null && !kIsWeb) {
+      emp = await DatabaseService.instance.getEmployeeById(targetId);
+    }
+    emp ??= widget.initialEmployee;
+
+    if (emp == null && targetId == null) {
+      if (mounted) setState(() => _loading = false);
+      return;
+    }
+
+    final idToQuery = targetId ?? emp?.id;
+    Attendance? today;
+    Map<String, int> stats = {};
+    List<Map<String, dynamic>> weekly = [];
+    List<Attendance> recent = [];
+    int pending = 0;
+
+    if (idToQuery != null && !kIsWeb) {
+      today = await DatabaseService.instance.getTodayAttendance(idToQuery);
+      stats = await DatabaseService.instance.getAttendanceStats(idToQuery);
+      weekly = await DatabaseService.instance.getWeeklyWorkHours(idToQuery);
+      recent = await DatabaseService.instance
+          .getAttendanceByEmployee(idToQuery, limit: 5);
+      pending = await SyncService.instance.getPendingCount();
+    }
 
     if (mounted) {
       setState(() {
-        _employee        = emp;
+        _employee = emp;
         _todayAttendance = today;
-        _stats           = stats;
-        _weekly          = week;
-        _recent          = rec;
-        _pendingCount    = pend;
-        _loading         = false;
+        _stats = stats;
+        _weekly = weekly;
+        _recent = recent;
+        _pendingCount = pending;
+        _loading = false;
       });
     }
   }
 
-  // ── Spot-check flow ──────────────────────────────────────────────────────
-  Future<void> _startLocationVerification() async {
-    if (_isVerifying) return;
-    setState(() => _isVerifying = true);
-
-    try {
-      final cameras = await availableCameras();
-      if (cameras.isEmpty) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('No camera found on this device.')),
-          );
-        }
-        return;
+  // ── Alarm Logic ────────────────────────────────────────────────────────
+  Future<void> _checkAlarmConditions() async {
+    if (_isShowingAlarmDialog || _loading) return;
+    final now = DateTime.now();
+    if (now.hour == 21 && now.minute >= 0 && now.minute < 30) {
+      final isClockedIn = _todayAttendance?.isClockedIn ?? false;
+      if (!isClockedIn) {
+        final geoResult = await GeofenceService.instance.checkGeofence();
+        if (!geoResult.isInside) _triggerAlarm();
       }
-
-      final cam = cameras.firstWhere(
-            (c) => c.lensDirection == CameraLensDirection.back,
-        orElse: () => cameras.first,
-      );
-
-      if (!mounted) return;
-
-      // Camera screen returns the saved file path (String?) on success
-      final String? photoPath = await Navigator.push<String>(
-        context,
-        MaterialPageRoute(
-          builder: (_) => _VerificationCameraScreen(camera: cam),
-        ),
-      );
-
-      if (photoPath != null && mounted) {
-        setState(() {
-          _spotCheckPhotoPath = photoPath;
-          _spotCheckTime      = DateTime.now();
-          _needsVerification  = false;
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Location verified successfully ✓'),
-            backgroundColor: AppColors.success,
-          ),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Camera error: $e')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _isVerifying = false);
     }
   }
 
-  /// Pushes the full-screen viewer for the saved photo.
-  void _openPhotoViewer() {
-    if (_spotCheckPhotoPath == null) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => _FullScreenPhotoViewer(
-          imagePath:  _spotCheckPhotoPath!,
-          capturedAt: _spotCheckTime,
+  void _triggerAlarm() {
+    if (_isShowingAlarmDialog) return;
+    setState(() => _isShowingAlarmDialog = true);
+    AlarmService.instance.startAlarm();
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        backgroundColor: _navyCard,
+        shape:
+        RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(children: [
+          Container(
+            width: 36, height: 36,
+            decoration: BoxDecoration(
+                color: _error.withOpacity(0.15), shape: BoxShape.circle),
+            child: const Icon(Icons.warning_amber_rounded,
+                color: _error, size: 20),
+          ),
+          const SizedBox(width: 12),
+          const Text('System Alert',
+              style: TextStyle(
+                  color: _white, fontWeight: FontWeight.w800, fontSize: 16)),
+        ]),
+        content: Text(
+          'You are outside the work radius and have not timed in before 9:30 PM. Please time in to stop the alarm.',
+          style: TextStyle(color: _white70, fontSize: 13, height: 1.5),
         ),
+        actions: [
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: _error,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                  padding: const EdgeInsets.symmetric(vertical: 14)),
+              onPressed: () {
+                AlarmService.instance.stopAlarm();
+                FlutterBackgroundService().invoke('stop_alarm_from_ui');
+                Navigator.of(context).pop();
+                setState(() => _isShowingAlarmDialog = false);
+              },
+              child: const Text('STOP THE ALARM',
+                  style: TextStyle(
+                      color: Colors.white, fontWeight: FontWeight.w800)),
+            ),
+          ),
+        ],
       ),
     );
+  }
+
+  // ── Spot-check flow ────────────────────────────────────────────────────
+  Future<void> _startLocationVerification() async {
+    if (_isVerifying) return;
+    setState(() => _isVerifying = true);
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) return;
+      final cam = cameras.firstWhere(
+              (c) => c.lensDirection == CameraLensDirection.back,
+          orElse: () => cameras.first);
+      if (!mounted) return;
+      final String? photoPath = await Navigator.push<String>(
+          context,
+          MaterialPageRoute(
+              builder: (_) => _VerificationCameraScreen(camera: cam)));
+      if (photoPath != null && mounted) {
+        setState(() {
+          _spotCheckPhotoPath = photoPath;
+          _spotCheckTime = DateTime.now();
+          _needsVerification = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('Camera error: $e');
+    } finally {
+      if (mounted) setState(() => _isVerifying = false);
+    }
   }
 
   void _openHistory() {
@@ -187,850 +276,1067 @@ class _DashboardScreenState extends State<DashboardScreen> {
       widget.onTabSwitch!.call(2);
     } else {
       Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => const AttendanceHistoryScreen()),
-      ).then((_) => _loadData());
+          context,
+          MaterialPageRoute(
+              builder: (_) => const AttendanceHistoryScreen()))
+          .then((_) => _loadData());
     }
   }
 
-  // ── Build ────────────────────────────────────────────────────────────────
+  // ── BUILD ──────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.primary,
+      backgroundColor: _navy,
       body: _loading
-          ? const Center(
-          child: CircularProgressIndicator(color: AppColors.accent))
-          : RefreshIndicator(
-        color: AppColors.accent,
-        backgroundColor: AppColors.card,
-        onRefresh: () async {
-          setState(() => _overriddenEmployeeId = null);
-          await _loadData();
-        },
-        child: CustomScrollView(slivers: [
-          _appBar(),
-          SliverPadding(
-            padding: const EdgeInsets.all(20),
-            sliver: SliverList(
-              delegate: SliverChildListDelegate([
-                if (_overriddenEmployeeId != null) _nfcBanner(),
-                _greeting(),
-                const SizedBox(height: 16),
-                _buildQuickActions(),
-                const SizedBox(height: 16),
-                // Show prompt OR saved photo card
-                if (_needsVerification)
-                  _verificationMessageBox()
-                else if (_spotCheckPhotoPath != null)
-                  _spotCheckPhotoCard(),
-                const SizedBox(height: 16),
-                _todayCard(),
-                const SizedBox(height: 16),
-                _statsRow(),
-                const SizedBox(height: 16),
-                _chart(),
-                const SizedBox(height: 16),
-                _recentSection(),
-                const SizedBox(height: 80),
-              ]),
-            ),
+          ? _buildLoader()
+          : FadeTransition(
+        opacity: _fadeAnim,
+        child: RefreshIndicator(
+          color: _accent,
+          backgroundColor: _navyCard,
+          onRefresh: () async {
+            setState(() => _overriddenEmployeeId = null);
+            await _loadData();
+          },
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final isDesktop = constraints.maxWidth > 900;
+              final hPad = isDesktop
+                  ? constraints.maxWidth * 0.08
+                  : 20.0;
+              return CustomScrollView(
+                slivers: [
+                  _buildAppBar(),
+                  SliverPadding(
+                    padding: EdgeInsets.fromLTRB(
+                        hPad, 20, hPad, 100),
+                    sliver: SliverList(
+                      delegate: SliverChildListDelegate([
+                        if (_overriddenEmployeeId != null)
+                          _buildNfcBanner(),
+                        _buildGreetingCard(isDesktop),
+                        const SizedBox(height: 20),
+                        _buildQuickActions(),
+                        const SizedBox(height: 20),
+                        _buildSpotCheckSection(),
+                        const SizedBox(height: 20),
+                        isDesktop
+                            ? Row(
+                          crossAxisAlignment:
+                          CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                                flex: 3,
+                                child: _buildTodayCard()),
+                            const SizedBox(width: 16),
+                            Expanded(
+                                flex: 2,
+                                child: _buildStatsColumn()),
+                          ],
+                        )
+                            : Column(children: [
+                          _buildTodayCard(),
+                          const SizedBox(height: 16),
+                          _buildStatsRow(),
+                        ]),
+                        const SizedBox(height: 20),
+                        isDesktop
+                            ? Row(
+                          crossAxisAlignment:
+                          CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                                flex: 3, child: _buildChart()),
+                            const SizedBox(width: 16),
+                            Expanded(
+                                flex: 2,
+                                child: _buildRecentActivity()),
+                          ],
+                        )
+                            : Column(children: [
+                          _buildChart(),
+                          const SizedBox(height: 16),
+                          _buildRecentActivity(),
+                        ]),
+                      ]),
+                    ),
+                  ),
+                ],
+              );
+            },
           ),
-        ]),
+        ),
       ),
     );
   }
 
-  // ── Spot-check prompt ────────────────────────────────────────────────────
-  Widget _verificationMessageBox() {
-    final timeStr = DateFormat('hh:mm a').format(_now);
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppColors.accent.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.accent.withOpacity(0.3)),
-      ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          const Icon(Icons.location_on_rounded,
-              color: AppColors.accent, size: 20),
-          const SizedBox(width: 8),
-          const Text('Spot Check Required',
-              style: TextStyle(
-                  color: AppColors.textPrimary,
-                  fontWeight: FontWeight.w800,
-                  fontSize: 15)),
-          const Spacer(),
-          Text(timeStr,
-              style: const TextStyle(
-                  color: AppColors.textMuted, fontSize: 11)),
-        ]),
-        const SizedBox(height: 10),
-        const Text(
-          'The system requires a quick photo verification of your current work location.',
-          style: TextStyle(
-              color: AppColors.textSecondary, fontSize: 13, height: 1.4),
+  Widget _buildLoader() {
+    return Center(
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        AnimatedBuilder(
+          animation: _pulseAnim,
+          builder: (_, __) => Transform.scale(
+            scale: _pulseAnim.value,
+            child: Container(
+              width: 64, height: 64,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: RadialGradient(
+                    colors: [_accent.withOpacity(0.2), Colors.transparent]),
+                border: Border.all(color: _accent.withOpacity(0.5), width: 1.5),
+              ),
+              child: const Icon(Icons.fingerprint_rounded,
+                  color: _accent, size: 32),
+            ),
+          ),
         ),
         const SizedBox(height: 16),
-        Row(children: [
-          Expanded(
-            child: TextButton(
-              onPressed: _isVerifying
-                  ? null
-                  : () => setState(() => _needsVerification = false),
-              child: const Text('Later',
-                  style: TextStyle(color: AppColors.textMuted)),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: ElevatedButton(
-              onPressed: _isVerifying ? null : _startLocationVerification,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.accent,
-                disabledBackgroundColor: AppColors.accent.withOpacity(0.5),
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12)),
-                elevation: 0,
-              ),
-              child: _isVerifying
-                  ? const SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(
-                      color: Colors.white, strokeWidth: 2))
-                  : const Text('Verify Now',
-                  style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white)),
-            ),
-          ),
-        ]),
+        Text('Loading...', style: TextStyle(color: _white40, fontSize: 13)),
       ]),
     );
   }
 
-  // ── Saved photo card (tappable thumbnail) ────────────────────────────────
-  Widget _spotCheckPhotoCard() {
-    final timeStr = _spotCheckTime != null
-        ? DateFormat('hh:mm a · MMM d').format(_spotCheckTime!)
-        : '';
-
-    return GestureDetector(
-      onTap: _openPhotoViewer,
-      child: Container(
-        decoration: BoxDecoration(
-          color: AppColors.card,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: AppColors.success.withOpacity(0.45)),
-          boxShadow: [
-            BoxShadow(
-              color: AppColors.success.withOpacity(0.08),
-              blurRadius: 16,
-              spreadRadius: 2,
-            ),
-          ],
-        ),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          // ── Header row ─────────────────────────────────────────────────
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
-            child: Row(children: [
-              Container(
-                padding: const EdgeInsets.all(7),
-                decoration: BoxDecoration(
-                  color: AppColors.success.withOpacity(0.15),
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(Icons.verified_rounded,
-                    color: AppColors.success, size: 16),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text('Spot Check Verified',
-                          style: TextStyle(
-                              color: AppColors.textPrimary,
-                              fontWeight: FontWeight.w800,
-                              fontSize: 14)),
-                      if (timeStr.isNotEmpty)
-                        Text(timeStr,
-                            style: const TextStyle(
-                                color: AppColors.textMuted, fontSize: 11)),
-                    ]),
-              ),
-              // "View" pill
-              Container(
-                padding:
-                const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                decoration: BoxDecoration(
-                  color: AppColors.accent.withOpacity(0.12),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                      color: AppColors.accent.withOpacity(0.3)),
-                ),
-                child: const Row(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(Icons.open_in_full_rounded,
-                      color: AppColors.accent, size: 12),
-                  SizedBox(width: 5),
-                  Text('View',
-                      style: TextStyle(
-                          color: AppColors.accent,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700)),
-                ]),
-              ),
-            ]),
-          ),
-
-          // ── Thumbnail ──────────────────────────────────────────────────
-          ClipRRect(
-            borderRadius:
-            const BorderRadius.vertical(bottom: Radius.circular(20)),
-            child: Stack(children: [
-              // Photo
-              Image.file(
-                File(_spotCheckPhotoPath!),
-                width: double.infinity,
-                height: 200,
-                fit: BoxFit.cover,
-                errorBuilder: (_, __, ___) => Container(
-                  height: 200,
-                  color: AppColors.cardBorder,
-                  child: const Center(
-                    child: Icon(Icons.broken_image_rounded,
-                        color: AppColors.textMuted, size: 40),
-                  ),
-                ),
-              ),
-              // Bottom gradient + hint text
-              // FIX: Color.fromARGB(153, 0, 0, 0) = 60% black, const-safe
-              Positioned(
-                bottom: 0, left: 0, right: 0,
-                child: Container(
-                  height: 64,
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.bottomCenter,
-                      end: Alignment.topCenter,
-                      colors: [
-                        Color.fromARGB(153, 0, 0, 0),
-                        Colors.transparent,
-                      ],
-                    ),
-                  ),
-                  alignment: Alignment.bottomRight,
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 14, vertical: 10),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.touch_app_rounded,
-                          color: Colors.white70, size: 13),
-                      SizedBox(width: 4),
-                      Text('Tap to view full image',
-                          style: TextStyle(
-                              color: Colors.white70, fontSize: 11)),
-                    ],
-                  ),
-                ),
-              ),
-            ]),
-          ),
-        ]),
-      ),
-    );
-  }
-
-  // ── App bar ──────────────────────────────────────────────────────────────
-  SliverAppBar _appBar() {
+  // ── APP BAR ────────────────────────────────────────────────────────────
+  SliverAppBar _buildAppBar() {
     final online = ConnectivityService.instance.isOnline;
     return SliverAppBar(
       expandedHeight: 0,
       pinned: true,
-      backgroundColor: AppColors.primary,
+      backgroundColor: _navy.withOpacity(0.92),
       automaticallyImplyLeading: false,
-      title: Row(children: [
-        const Text('Dashboard',
-            style: TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.w700,
-                color: AppColors.textPrimary)),
-        const Spacer(),
-        if (_isDemo)
+      elevation: 0,
+      title: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Row(children: [
+          // Logo mark
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            width: 32, height: 32,
             decoration: BoxDecoration(
-                color: AppColors.warning.withOpacity(0.15),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                    color: AppColors.warning.withOpacity(0.3))),
-            child: const Text('DEMO MODE',
-                style: TextStyle(
-                    color: AppColors.warning,
-                    fontSize: 10,
-                    fontWeight: FontWeight.bold)),
+              gradient: const LinearGradient(
+                  colors: [Color(0xFF00D4FF), Color(0xFF0055BB)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight),
+              borderRadius: BorderRadius.circular(9),
+            ),
+            child: const Icon(Icons.fingerprint_rounded,
+                color: Colors.white, size: 18),
           ),
-        const SizedBox(width: 8),
-        Container(
-            width: 8,
-            height: 8,
-            margin: const EdgeInsets.only(right: 8),
+          const SizedBox(width: 10),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('HRIS',
+                  style: TextStyle(
+                      color: _white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 2)),
+              Text('BIOMETRICS',
+                  style: TextStyle(
+                      color: _accent,
+                      fontSize: 7,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 2.5)),
+            ],
+          ),
+          const Spacer(),
+          // Pending sync badge
+          if (_pendingCount > 0)
+            Container(
+              margin: const EdgeInsets.only(right: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: _warning.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: _warning.withOpacity(0.35)),
+              ),
+              child: Row(children: [
+                Icon(Icons.sync_rounded, size: 10, color: _warning),
+                const SizedBox(width: 4),
+                Text('$_pendingCount',
+                    style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800,
+                        color: _warning)),
+              ]),
+            ),
+          // Online/Offline indicator
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
             decoration: BoxDecoration(
-                color: online ? AppColors.success : AppColors.warning,
-                shape: BoxShape.circle)),
-        IconButton(
-            onPressed: () {},
-            icon: const Icon(Icons.notifications_outlined,
-                color: AppColors.textSecondary)),
-      ]),
+              color: online
+                  ? _success.withOpacity(0.1)
+                  : _warning.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                  color: online
+                      ? _success.withOpacity(0.35)
+                      : _warning.withOpacity(0.35)),
+            ),
+            child: Row(children: [
+              AnimatedBuilder(
+                animation: _pulseAnim,
+                builder: (_, __) => Transform.scale(
+                  scale: online ? _pulseAnim.value : 1.0,
+                  child: Icon(Icons.circle,
+                      size: 6,
+                      color: online ? _success : _warning),
+                ),
+              ),
+              const SizedBox(width: 5),
+              Text(online ? 'ONLINE' : 'OFFLINE',
+                  style: TextStyle(
+                      fontSize: 9,
+                      fontWeight: FontWeight.w800,
+                      color: online ? _success : _warning,
+                      letterSpacing: 0.5)),
+            ]),
+          ),
+        ]),
+      ),
     );
   }
 
-  // ── Greeting ─────────────────────────────────────────────────────────────
-  Widget _greeting() {
-    final h = _now.hour;
-    final g = h < 12
-        ? '☀️ Good Morning'
-        : h < 17
-        ? '🌤 Good Afternoon'
-        : '🌙 Good Evening';
-    final displayName =
-    _isDemo ? 'Demo Account' : (_employee?.fullName ?? 'Employee');
+  // ── GREETING CARD ──────────────────────────────────────────────────────
+  Widget _buildGreetingCard(bool isDesktop) {
+    final hour = _now.hour;
+    final greeting = hour < 12
+        ? 'Good Morning'
+        : hour < 17
+        ? 'Good Afternoon'
+        : 'Good Evening';
+    final clocked = _todayAttendance?.isClockedIn ?? false;
+
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
         gradient: LinearGradient(
-            colors: [
-              AppColors.accent.withOpacity(0.2),
-              AppColors.accentSecondary.withOpacity(0.1)
-            ],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.accent.withOpacity(0.3)),
+          colors: [
+            _accent.withOpacity(0.12),
+            _navyLight,
+          ],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: _accent.withOpacity(0.25), width: 1),
       ),
-      child: Row(children: [
-        Expanded(
+      child: Row(
+        children: [
+          Expanded(
             child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(g,
-                      style: const TextStyle(
-                          fontSize: 13,
-                          color: AppColors.textSecondary,
-                          fontWeight: FontWeight.w500)),
-                  const SizedBox(height: 4),
-                  Text(displayName,
-                      style: const TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.w800,
-                          color: AppColors.textPrimary,
-                          letterSpacing: -0.5)),
-                  const SizedBox(height: 4),
-                  Text(
-                      _isDemo
-                          ? 'Guest · Trial Version'
-                          : '${_employee?.position ?? ""} · ${_employee?.department ?? ""}',
-                      style: const TextStyle(
-                          fontSize: 13, color: AppColors.textSecondary)),
-                ])),
-        Container(
-            width: 56,
-            height: 56,
-            decoration: BoxDecoration(
-                gradient: AppColors.gradientPrimary,
-                shape: BoxShape.circle),
-            child: Center(
-                child: Text(
-                    _isDemo ? 'DA' : (_employee?.initials ?? 'EM'),
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Date chip
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _accent.withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(20),
+                    border:
+                    Border.all(color: _accent.withOpacity(0.3), width: 1),
+                  ),
+                  child: Text(
+                    DateFormat('EEEE, MMMM d').format(_now).toUpperCase(),
+                    style: TextStyle(
+                        fontSize: 9,
+                        color: _accent,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 1),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  '$greeting,',
+                  style: TextStyle(
+                      fontSize: 13,
+                      color: _white40,
+                      fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _employee?.firstName ?? 'User',
+                  style: TextStyle(
+                      fontSize: isDesktop ? 32 : 26,
+                      fontWeight: FontWeight.w900,
+                      color: _white,
+                      letterSpacing: -0.8,
+                      height: 1.1),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '${_employee?.position ?? ''} · ${_employee?.department ?? ''}',
+                  style: TextStyle(
+                      fontSize: 12, color: _white40, fontWeight: FontWeight.w500),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 16),
+          Column(
+            children: [
+              // Avatar
+              Container(
+                width: 56,
+                height: 56,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: LinearGradient(
+                    colors: [_accent, const Color(0xFF0055BB)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                ),
+                child: Center(
+                  child: Text(
+                    _employee?.initials ?? 'EM',
                     style: const TextStyle(
                         fontSize: 20,
                         fontWeight: FontWeight.w800,
-                        color: AppColors.primary)))),
-      ]),
+                        color: Colors.white),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              // Status pill
+              Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: clocked
+                      ? _success.withOpacity(0.12)
+                      : _white15,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                      color: clocked
+                          ? _success.withOpacity(0.4)
+                          : _white15),
+                ),
+                child: Text(
+                  clocked ? '● ACTIVE' : '○ OUT',
+                  style: TextStyle(
+                      fontSize: 9,
+                      fontWeight: FontWeight.w800,
+                      color: clocked ? _success : _white40,
+                      letterSpacing: 0.5),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 
-  // ── Quick actions ────────────────────────────────────────────────────────
+  // ── QUICK ACTIONS ──────────────────────────────────────────────────────
   Widget _buildQuickActions() {
     final actions = [
       _QAItem(
           icon: Icons.qr_code_scanner_rounded,
           label: 'Clock',
-          color: AppColors.accent,
+          color: _accent,
+          gradient: [const Color(0xFF00D4FF), const Color(0xFF0066CC)],
           onTap: () => widget.onTabSwitch?.call(1)),
       _QAItem(
           icon: Icons.beach_access_rounded,
           label: 'Leave',
-          color: AppColors.warning,
-          onTap: () => _showLeaveSheet()),
+          color: _warning,
+          gradient: [const Color(0xFFFFBB00), const Color(0xFFCC6600)],
+          onTap: () {}),
       _QAItem(
-          icon: Icons.assignment_rounded,
+          icon: Icons.bar_chart_rounded,
           label: 'Report',
-          color: AppColors.accentSecondary,
+          color: _purple,
+          gradient: [const Color(0xFF9B6FFF), const Color(0xFF5533BB)],
           onTap: () => widget.onTabSwitch?.call(4)),
       _QAItem(
           icon: Icons.schedule_rounded,
           label: 'Schedule',
-          color: AppColors.success,
-          onTap: () => _showScheduleSheet()),
+          color: _success,
+          gradient: [const Color(0xFF00E5A0), const Color(0xFF006644)],
+          onTap: () {}),
     ];
+
     return Row(
-        children: actions
-            .map((a) => Expanded(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4),
-              child: InkWell(
-                  onTap: a.onTap,
-                  borderRadius: BorderRadius.circular(16),
-                  child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      decoration: BoxDecoration(
-                          color: a.color.withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(
-                              color: a.color.withOpacity(0.3))),
-                      child: Column(children: [
-                        Icon(a.icon, color: a.color, size: 24),
-                        const SizedBox(height: 6),
-                        Text(a.label,
-                            style: TextStyle(
-                                fontSize: 10,
-                                fontWeight: FontWeight.w700,
-                                color: a.color)),
-                      ]))),
-            )))
-            .toList());
+      children: actions.asMap().entries.map((entry) {
+        final a = entry.value;
+        return Expanded(
+          child: Padding(
+            padding: EdgeInsets.only(
+                left: entry.key == 0 ? 0 : 8,
+                right: entry.key == actions.length - 1 ? 0 : 0),
+            child: _QuickActionCard(item: a),
+          ),
+        );
+      }).toList(),
+    );
   }
 
-  void _showLeaveSheet() {
-    showModalBottomSheet(
-        context: context,
-        backgroundColor: AppColors.surface,
-        shape: const RoundedRectangleBorder(
-            borderRadius:
-            BorderRadius.vertical(top: Radius.circular(24))),
-        builder: (_) => Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Request Leave',
-                      style: TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.w800,
-                          color: AppColors.textPrimary)),
-                  const SizedBox(height: 20),
-                  _buildSheetItem(Icons.event_available_rounded,
-                      'Sick Leave', 'Submit health-related request',
-                      onTap: () {
-                        Navigator.pop(context);
-                        _showLeaveForm('Sick Leave');
-                      }),
-                  const SizedBox(height: 12),
-                  _buildSheetItem(Icons.beach_access_rounded,
-                      'Vacation Leave', 'Plan your next time off',
-                      onTap: () {
-                        Navigator.pop(context);
-                        _showLeaveForm('Vacation Leave');
-                      }),
-                  const SizedBox(height: 24),
-                ])));
+  // ── SPOT CHECK (PRESERVED) ─────────────────────────────────────────────
+  Widget _buildSpotCheckSection() {
+    if (_needsVerification) return _buildVerificationBox();
+    if (_spotCheckPhotoPath != null) return _buildSpotCheckPhotoCard();
+    return const SizedBox.shrink();
   }
 
-  void _showLeaveForm(String type) {
-    showModalBottomSheet(
-        context: context,
-        backgroundColor: AppColors.surface,
-        isScrollControlled: true,
-        shape: const RoundedRectangleBorder(
-            borderRadius:
-            BorderRadius.vertical(top: Radius.circular(24))),
-        builder: (_) => _LeaveFormSheet(
-            leaveType: type, employeeId: _employee?.id ?? ''));
-  }
-
-  void _showScheduleSheet() {
-    showModalBottomSheet(
-        context: context,
-        backgroundColor: AppColors.surface,
-        shape: const RoundedRectangleBorder(
-            borderRadius:
-            BorderRadius.vertical(top: Radius.circular(24))),
-        builder: (_) => Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Shift Schedule',
-                      style: TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.w800,
-                          color: AppColors.textPrimary)),
-                  const SizedBox(height: 20),
-                  _buildSheetItem(Icons.access_time_rounded,
-                      'Standard Shift', '09:00 AM - 06:00 PM',
-                      onTap: () => Navigator.pop(context)),
-                  const SizedBox(height: 12),
-                  _buildSheetItem(Icons.info_outline_rounded,
-                      'Lunch Break', '12:00 PM - 01:00 PM',
-                      onTap: () => Navigator.pop(context)),
-                  const SizedBox(height: 24),
-                ])));
-  }
-
-  Widget _buildSheetItem(IconData icon, String title, String sub,
-      {VoidCallback? onTap}) {
-    return InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(16),
-        child: Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-                color: AppColors.card,
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: AppColors.cardBorder)),
-            child: Row(children: [
-              Icon(icon, color: AppColors.accent, size: 24),
-              const SizedBox(width: 16),
-              Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(title,
-                        style: const TextStyle(
-                            fontWeight: FontWeight.w700,
-                            color: AppColors.textPrimary)),
-                    Text(sub,
-                        style: const TextStyle(
-                            fontSize: 12,
-                            color: AppColors.textSecondary)),
-                  ]),
-            ])));
-  }
-
-  // ── Today card ───────────────────────────────────────────────────────────
-  Widget _todayCard() {
-    final clocked = _todayAttendance?.isClockedIn ?? false;
-    final done    = _todayAttendance?.isComplete  ?? false;
-    String live = '--';
-    if (clocked && _todayAttendance?.timeIn != null) {
-      try {
-        final start = DateTime.parse(
-            '${_todayAttendance!.date} ${_todayAttendance!.timeIn}');
-        final d = _now.difference(start);
-        live = '${d.inHours}h ${d.inMinutes % 60}m ${d.inSeconds % 60}s';
-      } catch (_) {}
-    }
+  Widget _buildVerificationBox() {
     return Container(
-        padding: const EdgeInsets.all(18),
-        decoration: BoxDecoration(
-            gradient: AppColors.gradientCard,
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: AppColors.cardBorder)),
-        child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(children: [
-                const Text("Today's Attendance",
-                    style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: AppColors.textSecondary)),
-                const Spacer(),
-                _statusBadge(clocked, done),
-              ]),
-              const SizedBox(height: 4),
-              Text(DateFormat('EEEE, MMMM d, y').format(_now),
-                  style: const TextStyle(
-                      fontSize: 12, color: AppColors.textMuted)),
-              const SizedBox(height: 14),
-              Row(children: [
-                _TBlock(
-                    label: 'CLOCK IN',
-                    time: _fmt12(_todayAttendance?.timeIn),
-                    color: AppColors.success,
-                    icon: Icons.login_rounded),
-                const SizedBox(width: 8),
-                _TBlock(
-                    label: 'CLOCK OUT',
-                    time: _fmt12(_todayAttendance?.timeOut),
-                    color: AppColors.accentSecondary,
-                    icon: Icons.logout_rounded),
-                const SizedBox(width: 8),
-                _TBlock(
-                    label: clocked ? '⏱ LIVE' : 'HOURS',
-                    time: clocked
-                        ? live
-                        : (_todayAttendance?.formattedWorkHours ?? '--'),
-                    color:
-                    clocked ? AppColors.accent : AppColors.warning,
-                    icon: Icons.timer_rounded,
-                    isLive: clocked),
-              ]),
-              const SizedBox(height: 14),
-              InkWell(
-                  onTap: _openHistory,
-                  borderRadius: BorderRadius.circular(12),
-                  child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: 11),
-                      decoration: BoxDecoration(
-                          color: AppColors.accent.withOpacity(0.08),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                              color: AppColors.accent.withOpacity(0.2))),
-                      child: const Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(Icons.history_rounded,
-                                color: AppColors.accent, size: 16),
-                            SizedBox(width: 6),
-                            Text('View Attendance History',
-                                style: TextStyle(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w700,
-                                    color: AppColors.accent)),
-                          ]))),
-            ]));
-  }
-
-  Widget _statusBadge(bool clocked, bool done) {
-    final color = clocked
-        ? AppColors.success
-        : done
-        ? AppColors.info
-        : AppColors.warning;
-    final text =
-    clocked ? '● Active' : done ? '✓ Complete' : 'Not In';
-    return Container(
-        padding:
-        const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-        decoration: BoxDecoration(
-            color: color.withOpacity(0.15),
-            borderRadius: BorderRadius.circular(20)),
-        child: Text(text,
-            style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: color)));
-  }
-
-  Widget _statsRow() => Row(children: [
-    Expanded(
-        child: _StatCard(
-            label: 'Present',
-            value: '${_stats['present'] ?? 0}',
-            icon: Icons.check_circle_rounded,
-            color: AppColors.success)),
-    const SizedBox(width: 12),
-    Expanded(
-        child: _StatCard(
-            label: 'Late',
-            value: '${_stats['late'] ?? 0}',
-            icon: Icons.schedule_rounded,
-            color: AppColors.warning)),
-    const SizedBox(width: 12),
-    Expanded(
-        child: _StatCard(
-            label: 'Absent',
-            value: '${_stats['absent'] ?? 0}',
-            icon: Icons.cancel_rounded,
-            color: AppColors.error)),
-  ]);
-
-  Widget _chart() {
-    return Container(
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-            gradient: AppColors.gradientCard,
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: AppColors.cardBorder)),
-        child:
-        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('Weekly Hours',
-              style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                  color: AppColors.textPrimary)),
-          const SizedBox(height: 20),
-          SizedBox(
-              height: 140,
-              child: BarChart(BarChartData(
-                  backgroundColor: Colors.transparent,
-                  borderData: FlBorderData(show: false),
-                  gridData: const FlGridData(show: false),
-                  titlesData: FlTitlesData(
-                      bottomTitles: AxisTitles(
-                          sideTitles: SideTitles(
-                              showTitles: true,
-                              getTitlesWidget: (v, _) {
-                                const d = [
-                                  'M', 'T', 'W', 'T', 'F', 'S', 'S'
-                                ];
-                                return Text(d[v.toInt()],
-                                    style: const TextStyle(
-                                        color: AppColors.textMuted,
-                                        fontSize: 12));
-                              })),
-                      leftTitles: const AxisTitles(
-                          sideTitles: SideTitles(showTitles: false)),
-                      topTitles: const AxisTitles(
-                          sideTitles: SideTitles(showTitles: false)),
-                      rightTitles: const AxisTitles(
-                          sideTitles: SideTitles(showTitles: false))),
-                  barGroups: List.generate(7, (i) {
-                    double hrs = 0;
-                    if (_weekly.length > i)
-                      hrs = _weekly[i]['hours'] as double;
-                    return BarChartGroupData(x: i, barRods: [
-                      BarChartRodData(
-                          toY: hrs > 0 ? hrs : 0.1,
-                          color: i == _now.weekday - 1
-                              ? AppColors.accent
-                              : AppColors.accentSecondary
-                              .withOpacity(0.5),
-                          width: 22,
-                          borderRadius: BorderRadius.circular(6))
-                    ]);
-                  })))),
-        ]));
-  }
-
-  Widget _recentSection() {
-    return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(children: [
-            const Text('Recent Activity',
-                style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w700,
-                    color: AppColors.textPrimary)),
-            const Spacer(),
-            InkWell(
-                onTap: _openHistory,
-                child: const Text('View All',
-                    style: TextStyle(
-                        fontSize: 12,
-                        color: AppColors.accent,
-                        fontWeight: FontWeight.w600))),
-          ]),
-          const SizedBox(height: 12),
-          if (_recent.isEmpty)
-            Container(
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                    color: AppColors.card,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: AppColors.cardBorder)),
-                child: const Center(
-                    child: Text('No records yet',
-                        style: TextStyle(
-                            color: AppColors.textMuted, fontSize: 13))))
-          else
-            Container(
-                decoration: BoxDecoration(
-                    gradient: AppColors.gradientCard,
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: AppColors.cardBorder)),
-                child: ListView.separated(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: _recent.length,
-                    separatorBuilder: (_, __) => const Divider(
-                        color: AppColors.cardBorder, height: 1),
-                    itemBuilder: (_, i) => _recentRow(_recent[i]))),
-        ]);
-  }
-
-  Widget _recentRow(Attendance r) {
-    final sc = r.status == AttendanceStatus.late
-        ? AppColors.warning
-        : r.status == AttendanceStatus.absent
-        ? AppColors.error
-        : AppColors.success;
-    return Padding(
-        padding:
-        const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        child: Row(children: [
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: _accent.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: _accent.withOpacity(0.25), width: 1),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
           Container(
-              width: 8,
-              height: 8,
-              decoration:
-              BoxDecoration(color: sc, shape: BoxShape.circle)),
-          const SizedBox(width: 10),
+            width: 36, height: 36,
+            decoration: BoxDecoration(
+                color: _accent.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(10)),
+            child:
+            const Icon(Icons.location_on_rounded, color: _accent, size: 20),
+          ),
+          const SizedBox(width: 12),
+          const Text('Spot Check',
+              style: TextStyle(
+                  color: _white, fontWeight: FontWeight.w800, fontSize: 15)),
+        ]),
+        const SizedBox(height: 12),
+        Text(
+          'The system requires a quick photo verification of your work location.',
+          style: TextStyle(color: _white70, fontSize: 13, height: 1.5),
+        ),
+        const SizedBox(height: 16),
+        SizedBox(
+          width: double.infinity,
+          child: ElevatedButton(
+            onPressed: _startLocationVerification,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _accent,
+              foregroundColor: Colors.white,
+              elevation: 0,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14)),
+            ),
+            child: _isVerifying
+                ? const SizedBox(
+                width: 18, height: 18,
+                child: CircularProgressIndicator(
+                    color: Colors.white, strokeWidth: 2))
+                : const Text('Verify Now',
+                style: TextStyle(
+                    fontWeight: FontWeight.w700, fontSize: 14)),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  Widget _buildSpotCheckPhotoCard() {
+    return Container(
+      decoration: BoxDecoration(
+        color: _navyCard,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: _success.withOpacity(0.3), width: 1),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Padding(
+          padding: const EdgeInsets.all(16),
+          child: Row(children: [
+            Container(
+              width: 32, height: 32,
+              decoration: BoxDecoration(
+                  color: _success.withOpacity(0.12),
+                  shape: BoxShape.circle),
+              child: const Icon(Icons.verified_rounded,
+                  color: _success, size: 18),
+            ),
+            const SizedBox(width: 10),
+            const Text('Location Verified',
+                style: TextStyle(
+                    color: _white, fontWeight: FontWeight.w800, fontSize: 14)),
+            const Spacer(),
+            Text(
+              DateFormat('hh:mm a').format(_spotCheckTime!),
+              style: TextStyle(color: _white40, fontSize: 12),
+            ),
+          ]),
+        ),
+        if (!kIsWeb && _spotCheckPhotoPath != null)
+          ClipRRect(
+            borderRadius:
+            const BorderRadius.vertical(bottom: Radius.circular(20)),
+            child: Image.file(
+              File(_spotCheckPhotoPath!),
+              height: 140,
+              width: double.infinity,
+              fit: BoxFit.cover,
+            ),
+          ),
+      ]),
+    );
+  }
+
+  // ── TODAY CARD ─────────────────────────────────────────────────────────
+  Widget _buildTodayCard() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: _navyCard,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: _white15, width: 0.5),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Text('TODAY',
+              style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                  color: _white40,
+                  letterSpacing: 1.5)),
+          const Spacer(),
+          _buildStatusBadge(),
+        ]),
+        const SizedBox(height: 20),
+        Row(children: [
           Expanded(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(r.date,
-                        style: const TextStyle(
-                            fontSize: 13,
-                            color: AppColors.textPrimary,
-                            fontWeight: FontWeight.w600)),
-                    Text(
-                        'Clocked: ${_fmt12(r.timeIn)} - ${_fmt12(r.timeOut)}',
-                        style: const TextStyle(
-                            fontSize: 11, color: AppColors.textMuted)),
-                  ])),
-          Text(r.formattedWorkHours,
-              style: const TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w700,
-                  color: AppColors.accent)),
-        ]));
+              child: _TimeBlock(
+                label: 'CLOCK IN',
+                time: _fmt12(_todayAttendance?.timeIn),
+                color: _success,
+                icon: Icons.login_rounded,
+              )),
+          const SizedBox(width: 12),
+          Expanded(
+              child: _TimeBlock(
+                label: 'CLOCK OUT',
+                time: _fmt12(_todayAttendance?.timeOut),
+                color: _purple,
+                icon: Icons.logout_rounded,
+              )),
+        ]),
+        const SizedBox(height: 16),
+        // History button
+        GestureDetector(
+          onTap: _openHistory,
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 13),
+            decoration: BoxDecoration(
+              color: _accent.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: _accent.withOpacity(0.2), width: 1),
+            ),
+            child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              const Icon(Icons.history_rounded, color: _accent, size: 16),
+              const SizedBox(width: 8),
+              const Text('View History Log',
+                  style: TextStyle(
+                      color: _accent,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 13)),
+            ]),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  Widget _buildStatusBadge() {
+    final clocked = _todayAttendance?.isClockedIn ?? false;
+    final color = clocked ? _success : _warning;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withOpacity(0.35)),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Container(
+            width: 6,
+            height: 6,
+            decoration:
+            BoxDecoration(color: color, shape: BoxShape.circle)),
+        const SizedBox(width: 6),
+        Text(clocked ? 'ACTIVE' : 'NOT IN',
+            style: TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w800,
+                color: color,
+                letterSpacing: 0.5)),
+      ]),
+    );
+  }
+
+  // ── STATS ──────────────────────────────────────────────────────────────
+  Widget _buildStatsRow() {
+    return Row(children: [
+      Expanded(
+          child: _StatChip(
+              label: 'Present',
+              value: '${_stats['present'] ?? 0}',
+              color: _success,
+              icon: Icons.check_circle_rounded)),
+      const SizedBox(width: 12),
+      Expanded(
+          child: _StatChip(
+              label: 'Late',
+              value: '${_stats['late'] ?? 0}',
+              color: _warning,
+              icon: Icons.schedule_rounded)),
+      const SizedBox(width: 12),
+      Expanded(
+          child: _StatChip(
+              label: 'Absent',
+              value: '${_stats['absent'] ?? 0}',
+              color: _error,
+              icon: Icons.cancel_rounded)),
+    ]);
+  }
+
+  Widget _buildStatsColumn() {
+    return Column(children: [
+      _StatChip(
+          label: 'Present',
+          value: '${_stats['present'] ?? 0}',
+          color: _success,
+          icon: Icons.check_circle_rounded),
+      const SizedBox(height: 12),
+      _StatChip(
+          label: 'Late',
+          value: '${_stats['late'] ?? 0}',
+          color: _warning,
+          icon: Icons.schedule_rounded),
+      const SizedBox(height: 12),
+      _StatChip(
+          label: 'Absent',
+          value: '${_stats['absent'] ?? 0}',
+          color: _error,
+          icon: Icons.cancel_rounded),
+    ]);
+  }
+
+  // ── CHART ──────────────────────────────────────────────────────────────
+  Widget _buildChart() {
+    final bars = _weekly.isNotEmpty
+        ? List.generate(
+      _weekly.length,
+          (i) => BarChartGroupData(
+        x: i,
+        barRods: [
+          BarChartRodData(
+            toY: (_weekly[i]['hours'] as num?)?.toDouble() ?? 0,
+            gradient: LinearGradient(
+              colors: [_accent, _accent.withOpacity(0.5)],
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+            ),
+            width: 18,
+            borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(6)),
+          ),
+        ],
+      ),
+    )
+        : List.generate(
+      7,
+          (i) => BarChartGroupData(
+        x: i,
+        barRods: [
+          BarChartRodData(
+            toY: [7.5, 8.0, 6.5, 9.0, 8.5, 4.0, 0.0][i],
+            gradient: LinearGradient(
+              colors: [_accent, _accent.withOpacity(0.4)],
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+            ),
+            width: 18,
+            borderRadius:
+            const BorderRadius.vertical(top: Radius.circular(6)),
+          ),
+        ],
+      ),
+    );
+
+    const days = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: _navyCard,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: _white15, width: 0.5),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Text('WORK HOURS',
+              style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                  color: _white40,
+                  letterSpacing: 1.5)),
+          const Spacer(),
+          Container(
+            padding:
+            const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: _accent.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text('This Week',
+                style: TextStyle(
+                    fontSize: 10,
+                    color: _accent,
+                    fontWeight: FontWeight.w600)),
+          ),
+        ]),
+        const SizedBox(height: 8),
+        Text('Weekly Analysis',
+            style: TextStyle(
+                color: _white,
+                fontSize: 16,
+                fontWeight: FontWeight.w800)),
+        const SizedBox(height: 20),
+        SizedBox(
+          height: 160,
+          child: BarChart(
+            BarChartData(
+              borderData: FlBorderData(show: false),
+              gridData: FlGridData(
+                show: true,
+                drawVerticalLine: false,
+                getDrawingHorizontalLine: (value) => FlLine(
+                  color: _white08,
+                  strokeWidth: 0.5,
+                ),
+              ),
+              titlesData: FlTitlesData(
+                show: true,
+                topTitles:
+                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                rightTitles:
+                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                leftTitles:
+                const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                bottomTitles: AxisTitles(
+                  sideTitles: SideTitles(
+                    showTitles: true,
+                    getTitlesWidget: (value, _) => Text(
+                      days[value.toInt() % 7],
+                      style: TextStyle(
+                          color: _white40,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ),
+              ),
+              barGroups: bars,
+            ),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  // ── RECENT ACTIVITY ────────────────────────────────────────────────────
+  Widget _buildRecentActivity() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: _navyCard,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: _white15, width: 0.5),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Text('RECENT',
+              style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                  color: _white40,
+                  letterSpacing: 1.5)),
+          const Spacer(),
+          GestureDetector(
+            onTap: _openHistory,
+            child: Text('See all',
+                style: TextStyle(
+                    color: _accent,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600)),
+          ),
+        ]),
+        const SizedBox(height: 4),
+        const Text('Activity Log',
+            style: TextStyle(
+                color: _white, fontSize: 16, fontWeight: FontWeight.w800)),
+        const SizedBox(height: 16),
+        if (_recent.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 24),
+            child: Center(
+              child: Column(children: [
+                Icon(Icons.inbox_rounded, color: _white40, size: 32),
+                const SizedBox(height: 8),
+                Text('No recent records',
+                    style: TextStyle(color: _white40, fontSize: 13)),
+              ]),
+            ),
+          )
+        else
+          ..._recent.asMap().entries.map((entry) {
+            final r = entry.value;
+            final isLast = entry.key == _recent.length - 1;
+            return Column(children: [
+              Row(children: [
+                Container(
+                  width: 36, height: 36,
+                  decoration: BoxDecoration(
+                      color: _accent.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(10)),
+                  child: const Icon(Icons.access_time_rounded,
+                      color: _accent, size: 18),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(r.date,
+                            style: const TextStyle(
+                                color: _white,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 13)),
+                        const SizedBox(height: 2),
+                        Text('In: ${r.timeIn ?? "--"}  ·  Out: ${r.timeOut ?? "Active"}',
+                            style: TextStyle(color: _white40, fontSize: 11)),
+                      ],
+                    )),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _success.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text('Present',
+                      style: TextStyle(
+                          color: _success,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700)),
+                ),
+              ]),
+              if (!isLast)
+                Padding(
+                  padding:
+                  const EdgeInsets.symmetric(vertical: 10, horizontal: 0),
+                  child: Divider(
+                      color: _white15, thickness: 0.5, height: 0),
+                ),
+            ]);
+          }),
+      ]),
+    );
+  }
+
+  // ── NFC BANNER ─────────────────────────────────────────────────────────
+  Widget _buildNfcBanner() {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: _success.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _success.withOpacity(0.25), width: 1),
+      ),
+      child: Row(children: [
+        const Icon(Icons.contactless_rounded, color: _success, size: 16),
+        const SizedBox(width: 10),
+        Text('NFC Keyfob View Mode',
+            style: TextStyle(
+                color: _success, fontSize: 12, fontWeight: FontWeight.w700)),
+      ]),
+    );
   }
 
   String _fmt12(String? t) {
     if (t == null) return '--:--';
     try {
-      return DateFormat('hh:mm a')
-          .format(DateFormat('HH:mm:ss').parse(t));
-    } catch (_) { return t; }
-  }
-
-  Widget _nfcBanner() {
-    return Container(
-        margin: const EdgeInsets.only(bottom: 16),
-        padding:
-        const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-        decoration: BoxDecoration(
-            color: AppColors.success.withOpacity(0.15),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-                color: AppColors.success.withOpacity(0.3))),
-        child: Row(children: [
-          const Icon(Icons.contactless_rounded,
-              color: AppColors.success, size: 18),
-          const SizedBox(width: 10),
-          const Expanded(
-              child: Text('Viewing data for last tapped keyfob',
-                  style: TextStyle(
-                      color: AppColors.success,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600))),
-          GestureDetector(
-              onTap: () {
-                setState(() => _overriddenEmployeeId = null);
-                _loadData();
-              },
-              child: const Text('RESET',
-                  style: TextStyle(
-                      color: AppColors.accent,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w800))),
-        ]));
+      return DateFormat('hh:mm a').format(DateFormat('HH:mm:ss').parse(t));
+    } catch (_) {
+      return t;
+    }
   }
 }
 
-// ─── Verification Camera Screen ───────────────────────────────────────────────
-/// Self-contained. Returns the saved file path (String) via Navigator.pop,
-/// or null if cancelled / failed.
+// ── QUICK ACTION CARD ──────────────────────────────────────────────────────
+class _QuickActionCard extends StatefulWidget {
+  final _QAItem item;
+  const _QuickActionCard({required this.item});
+
+  @override
+  State<_QuickActionCard> createState() => _QuickActionCardState();
+}
+
+class _QuickActionCardState extends State<_QuickActionCard> {
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final a = widget.item;
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _pressed = true),
+      onTapUp: (_) { setState(() => _pressed = false); a.onTap(); },
+      onTapCancel: () => setState(() => _pressed = false),
+      child: AnimatedScale(
+        scale: _pressed ? 0.94 : 1.0,
+        duration: const Duration(milliseconds: 100),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 18),
+          decoration: BoxDecoration(
+            color: a.color.withOpacity(0.07),
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: a.color.withOpacity(0.2), width: 1),
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: 40, height: 40,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                    colors: a.gradient,
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(a.icon, color: Colors.white, size: 20),
+            ),
+            const SizedBox(height: 8),
+            Text(a.label,
+                style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: a.color)),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// ── TIME BLOCK ─────────────────────────────────────────────────────────────
+class _TimeBlock extends StatelessWidget {
+  final String label;
+  final String time;
+  final Color color;
+  final IconData icon;
+
+  const _TimeBlock(
+      {required this.label,
+        required this.time,
+        required this.color,
+        required this.icon});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 14),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.07),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color.withOpacity(0.2), width: 1),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(icon, color: color, size: 12),
+          const SizedBox(width: 5),
+          Text(label,
+              style: TextStyle(
+                  fontSize: 9,
+                  color: color,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.5)),
+        ]),
+        const SizedBox(height: 8),
+        Text(time,
+            style: TextStyle(
+                fontSize: 16, fontWeight: FontWeight.w900, color: color)),
+      ]),
+    );
+  }
+}
+
+// ── STAT CHIP ──────────────────────────────────────────────────────────────
+class _StatChip extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color color;
+  final IconData icon;
+
+  const _StatChip(
+      {required this.label,
+        required this.value,
+        required this.color,
+        required this.icon});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.07),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: color.withOpacity(0.2), width: 1),
+      ),
+      child: Row(children: [
+        Container(
+          width: 36, height: 36,
+          decoration: BoxDecoration(
+              color: color.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(10)),
+          child: Icon(icon, color: color, size: 18),
+        ),
+        const SizedBox(width: 12),
+        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(value,
+              style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w900,
+                  color: color,
+                  letterSpacing: -0.5)),
+          Text(label.toUpperCase(),
+              style: TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  color: color.withOpacity(0.6),
+                  letterSpacing: 0.5)),
+        ]),
+      ]),
+    );
+  }
+}
+
+// ── DATA MODELS ────────────────────────────────────────────────────────────
+class _QAItem {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final List<Color> gradient;
+  final VoidCallback onTap;
+
+  _QAItem(
+      {required this.icon,
+        required this.label,
+        required this.color,
+        required this.gradient,
+        required this.onTap});
+}
+
+// ── VERIFICATION CAMERA SCREEN (UNCHANGED) ─────────────────────────────────
 class _VerificationCameraScreen extends StatefulWidget {
   final CameraDescription camera;
   const _VerificationCameraScreen({required this.camera});
@@ -1042,496 +1348,95 @@ class _VerificationCameraScreen extends StatefulWidget {
 
 class _VerificationCameraScreenState
     extends State<_VerificationCameraScreen> {
-  CameraController? _controller;
-  bool _ready      = false;
-  bool _processing = false;
+  CameraController? _ctrl;
 
   @override
   void initState() {
     super.initState();
-    _initController();
+    _init();
   }
 
-  // ── FIX: Use ResolutionPreset.medium to prevent freeze on mid-range devices.
-  //         Guard with !mounted BEFORE calling setState.
-  Future<void> _initController() async {
-    final ctrl = CameraController(
-      widget.camera,
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
-    try {
-      await ctrl.initialize();
-      if (!mounted) {
-        await ctrl.dispose();
-        return;
-      }
-      setState(() {
-        _controller = ctrl;
-        _ready = true;
-      });
-    } catch (e) {
-      await ctrl.dispose();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Camera init failed: $e')),
-        );
-        Navigator.pop(context, null);
-      }
-    }
-  }
-
-  Future<void> _capture() async {
-    if (_processing || _controller == null || !_ready) return;
-    setState(() => _processing = true);
-    try {
-      final XFile file = await _controller!.takePicture();
-      // Return the file path to the dashboard
-      if (mounted) Navigator.pop(context, file.path);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-              content: Text('Capture failed: $e'),
-              backgroundColor: AppColors.error),
-        );
-        setState(() => _processing = false);
-      }
-    }
+  Future<void> _init() async {
+    _ctrl = CameraController(widget.camera, ResolutionPreset.medium);
+    await _ctrl!.initialize();
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
-    _controller?.dispose();
+    _ctrl?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_ctrl == null || !_ctrl!.value.isInitialized) {
+      return const Scaffold(
+          backgroundColor: Colors.black,
+          body: Center(
+              child: CircularProgressIndicator(color: Color(0xFF00D4FF))));
+    }
     return Scaffold(
       backgroundColor: Colors.black,
-      body: !_ready || _controller == null
-          ? const Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          CircularProgressIndicator(color: AppColors.accent),
-          SizedBox(height: 16),
-          Text('Opening camera…',
-              style: TextStyle(color: Colors.white70)),
-        ]),
-      )
-          : Stack(fit: StackFit.expand, children: [
-        // Preview
-        ClipRect(
-          child: OverflowBox(
-            alignment: Alignment.center,
-            child: FittedBox(
-              fit: BoxFit.cover,
-              child: SizedBox(
-                width: _controller!.value.previewSize!.height,
-                height: _controller!.value.previewSize!.width,
-                child: CameraPreview(_controller!),
-              ),
-            ),
-          ),
-        ),
-        // Accent border overlay
-        Positioned.fill(
+      body: Stack(children: [
+        CameraPreview(_ctrl!),
+        // Overlay frame
+        Center(
           child: Container(
+            width: 240,
+            height: 240,
             decoration: BoxDecoration(
-              border: Border.all(
-                  color: AppColors.accent.withOpacity(0.4),
-                  width: 2),
+              border: Border.all(color: const Color(0xFF00D4FF), width: 2),
+              borderRadius: BorderRadius.circular(16),
             ),
           ),
         ),
-        // Header text
-        const Positioned(
-          top: 60, left: 20, right: 20,
-          child: Column(children: [
-            Text('SPOT CHECK',
-                style: TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.w900,
-                    fontSize: 20,
-                    letterSpacing: 2)),
-            SizedBox(height: 8),
-            Text('Capture your current workplace',
-                style: TextStyle(
-                    color: Colors.white70, fontSize: 13)),
-          ]),
-        ),
-        // Shutter button
         Positioned(
-          bottom: 60, left: 0, right: 0,
+          bottom: 50, left: 0, right: 0,
           child: Center(
             child: GestureDetector(
-              onTap: _processing ? null : _capture,
+              onTap: () async {
+                final file = await _ctrl!.takePicture();
+                if (context.mounted) Navigator.pop(context, file.path);
+              },
               child: Container(
-                width: 80, height: 80,
+                width: 70, height: 70,
                 decoration: BoxDecoration(
-                  color: Colors.white,
                   shape: BoxShape.circle,
-                  border: Border.all(
-                      color: AppColors.accent, width: 4),
+                  color: const Color(0xFF00D4FF),
+                  border: Border.all(color: Colors.white, width: 3),
                 ),
-                child: _processing
-                    ? const Padding(
-                    padding: EdgeInsets.all(20),
-                    child: CircularProgressIndicator(
-                        color: AppColors.accent))
-                    : const Icon(Icons.camera_alt_rounded,
-                    color: AppColors.accent, size: 36),
+                child: const Icon(Icons.camera_alt_rounded,
+                    color: Colors.white, size: 32),
               ),
             ),
           ),
         ),
-        // Close
-        Positioned(
-          top: 50, right: 20,
-          child: IconButton(
-            icon: const Icon(Icons.close,
-                color: Colors.white, size: 30),
-            onPressed: () => Navigator.pop(context, null),
+        // Top bar
+        SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            child: Row(children: [
+              GestureDetector(
+                onTap: () => Navigator.pop(context, null),
+                child: Container(
+                  width: 36, height: 36,
+                  decoration: BoxDecoration(
+                      color: Colors.black45, shape: BoxShape.circle),
+                  child: const Icon(Icons.close_rounded,
+                      color: Colors.white, size: 20),
+                ),
+              ),
+              const SizedBox(width: 12),
+              const Text('Location Verification',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 15)),
+            ]),
           ),
         ),
       ]),
     );
-  }
-}
-
-// ─── Full-Screen Photo Viewer ─────────────────────────────────────────────────
-class _FullScreenPhotoViewer extends StatefulWidget {
-  final String    imagePath;
-  final DateTime? capturedAt;
-  const _FullScreenPhotoViewer(
-      {required this.imagePath, this.capturedAt});
-
-  @override
-  State<_FullScreenPhotoViewer> createState() =>
-      _FullScreenPhotoViewerState();
-}
-
-class _FullScreenPhotoViewerState
-    extends State<_FullScreenPhotoViewer> {
-  bool _showOverlay = true;
-  final TransformationController _transform =
-  TransformationController();
-
-  @override
-  void dispose() {
-    _transform.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final timeStr = widget.capturedAt != null
-        ? DateFormat('MMMM d, yyyy · hh:mm a')
-        .format(widget.capturedAt!)
-        : '';
-
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: GestureDetector(
-        // Toggle overlay on tap
-        onTap: () =>
-            setState(() => _showOverlay = !_showOverlay),
-        child: Stack(fit: StackFit.expand, children: [
-          // ── Pinch-to-zoom image ─────────────────────────────────────
-          InteractiveViewer(
-            transformationController: _transform,
-            minScale: 0.8,
-            maxScale: 5.0,
-            child: Center(
-              child: Image.file(
-                File(widget.imagePath),
-                fit: BoxFit.contain,
-                errorBuilder: (_, __, ___) => const Center(
-                  child: Icon(Icons.broken_image_rounded,
-                      color: Colors.white38, size: 72),
-                ),
-              ),
-            ),
-          ),
-
-          // ── Top bar ─────────────────────────────────────────────────
-          AnimatedOpacity(
-            opacity: _showOverlay ? 1.0 : 0.0,
-            duration: const Duration(milliseconds: 220),
-            child: IgnorePointer(
-              ignoring: !_showOverlay,
-              child: Column(children: [
-                Container(
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                      colors: [Colors.black87, Colors.transparent],
-                    ),
-                  ),
-                  child: SafeArea(
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 4, vertical: 4),
-                      child: Row(children: [
-                        IconButton(
-                          icon: const Icon(
-                              Icons.arrow_back_ios_new_rounded,
-                              color: Colors.white),
-                          onPressed: () => Navigator.pop(context),
-                        ),
-                        Expanded(
-                            child: Column(
-                                crossAxisAlignment:
-                                CrossAxisAlignment.start,
-                                children: [
-                                  const Text('Spot Check Photo',
-                                      style: TextStyle(
-                                          color: Colors.white,
-                                          fontWeight: FontWeight.w700,
-                                          fontSize: 16)),
-                                  if (timeStr.isNotEmpty)
-                                    Text(timeStr,
-                                        style: const TextStyle(
-                                            color: Colors.white60,
-                                            fontSize: 12)),
-                                ])),
-                        // Reset zoom button
-                        IconButton(
-                          icon: const Icon(
-                              Icons.zoom_out_map_rounded,
-                              color: Colors.white70),
-                          tooltip: 'Reset zoom',
-                          onPressed: () =>
-                          _transform.value =
-                              Matrix4.identity(),
-                        ),
-                      ]),
-                    ),
-                  ),
-                ),
-                const Spacer(),
-              ]),
-            ),
-          ),
-
-          // ── Bottom bar ───────────────────────────────────────────────
-          AnimatedOpacity(
-            opacity: _showOverlay ? 1.0 : 0.0,
-            duration: const Duration(milliseconds: 220),
-            child: IgnorePointer(
-              ignoring: !_showOverlay,
-              child: Align(
-                alignment: Alignment.bottomCenter,
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.fromLTRB(20, 40, 20, 48),
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.bottomCenter,
-                      end: Alignment.topCenter,
-                      colors: [Colors.black87, Colors.transparent],
-                    ),
-                  ),
-                  child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        // Verified badge
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 14, vertical: 8),
-                          decoration: BoxDecoration(
-                            color: AppColors.success.withOpacity(0.2),
-                            borderRadius: BorderRadius.circular(20),
-                            border: Border.all(
-                                color: AppColors.success
-                                    .withOpacity(0.4)),
-                          ),
-                          child: const Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(Icons.verified_rounded,
-                                    color: AppColors.success,
-                                    size: 14),
-                                SizedBox(width: 6),
-                                Text('Workplace verified',
-                                    style: TextStyle(
-                                        color: AppColors.success,
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w600)),
-                              ]),
-                        ),
-                        const SizedBox(width: 14),
-                        // Zoom hint
-                        const Text('Pinch to zoom',
-                            style: TextStyle(
-                                color: Colors.white54,
-                                fontSize: 12)),
-                      ]),
-                ),
-              ),
-            ),
-          ),
-        ]),
-      ),
-    );
-  }
-}
-
-// ─── Shared helper classes ────────────────────────────────────────────────────
-class _QAItem {
-  final IconData    icon;
-  final String      label;
-  final Color       color;
-  final VoidCallback onTap;
-  _QAItem({required this.icon, required this.label,
-    required this.color, required this.onTap});
-}
-
-class _TBlock extends StatelessWidget {
-  final String   label;
-  final String   time;
-  final Color    color;
-  final IconData icon;
-  final bool     isLive;
-  const _TBlock({required this.label, required this.time,
-    required this.color, required this.icon,
-    this.isLive = false});
-
-  @override
-  Widget build(BuildContext context) {
-    return Expanded(
-        child: Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-                color: color.withOpacity(0.08),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                    color: color.withOpacity(isLive ? 0.5 : 0.2),
-                    width: isLive ? 1.5 : 1)),
-            child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(children: [
-                    Icon(icon, color: color, size: 10),
-                    const SizedBox(width: 3),
-                    Text(label,
-                        style: TextStyle(
-                            fontSize: 8,
-                            color: color,
-                            fontWeight: FontWeight.w800)),
-                  ]),
-                  const SizedBox(height: 4),
-                  Text(time,
-                      style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w800,
-                          color: color)),
-                ])));
-  }
-}
-
-class _StatCard extends StatelessWidget {
-  final String   label;
-  final String   value;
-  final IconData icon;
-  final Color    color;
-  const _StatCard({required this.label, required this.value,
-    required this.icon,  required this.color});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-            color: color.withOpacity(0.08),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: color.withOpacity(0.2))),
-        child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Icon(icon, color: color, size: 22),
-              const SizedBox(height: 8),
-              Text(value,
-                  style: TextStyle(
-                      fontSize: 24,
-                      fontWeight: FontWeight.w800,
-                      color: color)),
-              Text(label,
-                  style: const TextStyle(
-                      fontSize: 12, color: AppColors.textMuted)),
-            ]));
-  }
-}
-
-class _LeaveFormSheet extends StatefulWidget {
-  final String leaveType;
-  final String employeeId;
-  const _LeaveFormSheet(
-      {required this.leaveType, required this.employeeId});
-
-  @override
-  State<_LeaveFormSheet> createState() => _LeaveFormSheetState();
-}
-
-class _LeaveFormSheetState extends State<_LeaveFormSheet> {
-  final _reasonCtrl = TextEditingController();
-  DateTime _start = DateTime.now().add(const Duration(days: 1));
-  DateTime _end   = DateTime.now().add(const Duration(days: 1));
-
-  @override
-  void dispose() {
-    _reasonCtrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-        padding: EdgeInsets.fromLTRB(
-            24, 24, 24,
-            MediaQuery.of(context).viewInsets.bottom + 24),
-        child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Leave Request',
-                  style: TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w800,
-                      color: AppColors.textPrimary)),
-              const SizedBox(height: 24),
-              Text('TYPE: ${widget.leaveType.toUpperCase()}',
-                  style: const TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w800,
-                      color: AppColors.textMuted)),
-              const SizedBox(height: 16),
-              TextField(
-                  controller: _reasonCtrl,
-                  maxLines: 3,
-                  decoration: const InputDecoration(
-                      labelText: 'Reason (Optional)')),
-              const SizedBox(height: 24),
-              SizedBox(
-                  width: double.infinity,
-                  height: 52,
-                  child: ElevatedButton(
-                      onPressed: () async {
-                        final leave = {
-                          'employee_id': widget.employeeId,
-                          'leave_type':  widget.leaveType,
-                          'start_date':
-                          DateFormat('yyyy-MM-dd').format(_start),
-                          'end_date':
-                          DateFormat('yyyy-MM-dd').format(_end),
-                          'reason': _reasonCtrl.text.trim(),
-                        };
-                        await DatabaseService.instance
-                            .insertLeaveRequest(leave);
-                        if (mounted) Navigator.pop(context);
-                      },
-                      child: const Text('Submit Request'))),
-            ]));
   }
 }

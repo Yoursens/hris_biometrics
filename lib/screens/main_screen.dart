@@ -1,7 +1,9 @@
 // lib/screens/main_screen.dart
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import '../theme/app_theme.dart';
+import '../models/employee.dart' as model;
 import 'dashboard_screen.dart';
 import 'clock_screen.dart';
 import 'attendance_history_screen.dart';
@@ -10,7 +12,8 @@ import 'reports_screen.dart';
 import 'profile_screen.dart';
 
 class MainScreen extends StatefulWidget {
-  const MainScreen({super.key});
+  final model.Employee? employee;
+  const MainScreen({super.key, this.employee});
 
   @override
   State<MainScreen> createState() => MainScreenState();
@@ -69,49 +72,159 @@ class MainScreenState extends State<MainScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.primary,
-      body: Stack(
+      body: Row(
         children: [
-          // 1. Content Layer
-          IndexedStack(
-            index: _currentIndex,
-            children: [
-              DashboardScreen(onTabSwitch: switchTab),
-              const ClockScreen(),
-              const AttendanceHistoryScreen(),
-              const EmployeesScreen(),
-              const ReportsScreen(),
-              const ProfileScreen(),
-            ],
-          ),
+          if (kIsWeb) _buildWebSidebar(),
+          Expanded(
+            child: Stack(
+              children: [
+                // 1. Content Layer
+                IndexedStack(
+                  index: _currentIndex,
+                  children: [
+                    DashboardScreen(onTabSwitch: switchTab, initialEmployee: widget.employee),
+                    ClockScreen(initialEmployee: widget.employee),
+                    AttendanceHistoryScreen(initialEmployee: widget.employee),
+                    const EmployeesScreen(),
+                    ReportsScreen(initialEmployee: widget.employee),
+                    ProfileScreen(initialEmployee: widget.employee),
+                  ],
+                ),
 
-          // 2. Dimmer Layer (Only when menu is open)
-          if (_menuOpen)
-            Positioned.fill(
-              child: GestureDetector(
-                onTap: _toggleMenu,
-                behavior: HitTestBehavior.opaque,
-                child: Container(color: Colors.black.withOpacity(0.7)),
-              ),
+                // 2. Dimmer Layer (Mobile Only when menu is open)
+                if (!kIsWeb && _menuOpen)
+                  Positioned.fill(
+                    child: GestureDetector(
+                      onTap: _toggleMenu,
+                      behavior: HitTestBehavior.opaque,
+                      child: Container(color: Colors.black.withValues(alpha: 0.7)),
+                    ),
+                  ),
+
+                // 3. Bottom Bar Background Layer (Mobile Only)
+                if (!kIsWeb)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: _buildBottomBarContainer(),
+                  ),
+
+                // 4. Radial Menu Items Layer (Mobile Only)
+                if (!kIsWeb) ..._buildRadialItems(),
+
+                // 5. Center FAB Layer (Mobile Only)
+                if (!kIsWeb)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: MediaQuery.of(context).padding.bottom + 20,
+                    child: Center(child: _buildCenterButton()),
+                  ),
+              ],
             ),
-
-          // 3. Bottom Bar Background Layer
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: _buildBottomBarContainer(),
           ),
+        ],
+      ),
+    );
+  }
 
-          // 4. Radial Menu Items Layer (Must be above Bottom Bar to be clickable)
-          ..._buildRadialItems(),
-
-          // 5. Center FAB Layer (On top of everything)
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: MediaQuery.of(context).padding.bottom + 20,
-            child: Center(child: _buildCenterButton()),
+  // ─── Web Sidebar ───────────────────────────────────────────────────────────
+  Widget _buildWebSidebar() {
+    return Container(
+      width: 260,
+      decoration: BoxDecoration(
+        color: AppColors.card,
+        border: Border(right: BorderSide(color: Colors.white.withValues(alpha: 0.05))),
+      ),
+      child: Column(
+        children: [
+          _buildWebLogo(),
+          const SizedBox(height: 20),
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              children: _navItems.map((item) => _webNavItem(item)).toList(),
+            ),
           ),
+          _buildWebProfileFooter(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWebLogo() {
+    return Container(
+      padding: const EdgeInsets.all(32),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              gradient: AppColors.gradientPrimary,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: const Icon(Icons.fingerprint_rounded, color: Colors.white, size: 24),
+          ),
+          const SizedBox(width: 12),
+          const Text('HRIS BIO', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w900, letterSpacing: -0.5)),
+        ],
+      ),
+    );
+  }
+
+  Widget _webNavItem(_NavData item) {
+    bool active = _currentIndex == item.index;
+    return InkWell(
+      onTap: () => switchTab(item.index),
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+        decoration: BoxDecoration(
+          color: active ? item.color.withValues(alpha: 0.1) : Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            Icon(item.icon, color: active ? item.color : Colors.white30, size: 20),
+            const SizedBox(width: 16),
+            Text(item.label, style: TextStyle(
+              color: active ? Colors.white : Colors.white60,
+              fontWeight: active ? FontWeight.bold : FontWeight.w500,
+              fontSize: 14
+            )),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWebProfileFooter() {
+    final emp = widget.employee;
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        border: Border(top: BorderSide(color: Colors.white.withValues(alpha: 0.05))),
+      ),
+      child: Row(
+        children: [
+          CircleAvatar(
+            backgroundColor: AppColors.accent, 
+            radius: 18, 
+            child: Text(emp?.initials ?? '?', style: const TextStyle(fontSize: 12, color: Colors.white))
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(emp?.fullName ?? 'Guest', style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
+                Text(emp?.position ?? 'User', style: const TextStyle(color: Colors.white30, fontSize: 11)),
+              ],
+            ),
+          ),
+          IconButton(onPressed: () {}, icon: const Icon(Icons.logout_rounded, color: Colors.white24, size: 18)),
         ],
       ),
     );
@@ -119,8 +232,8 @@ class MainScreenState extends State<MainScreen>
 
   // ─── Nav Items Data ────────────────────────────────────────────────────────
   static const _navItems = [
-    _NavData(icon: Icons.dashboard_rounded,   label: 'Home',      index: 0, color: Color(0xFF6C63FF)),
-    _NavData(icon: Icons.fingerprint_rounded, label: 'Clock',     index: 1, color: Color(0xFF00D4AA)),
+    _NavData(icon: Icons.dashboard_rounded,   label: 'Dashboard', index: 0, color: Color(0xFF6C63FF)),
+    _NavData(icon: Icons.fingerprint_rounded, label: 'Clock In/Out', index: 1, color: Color(0xFF00D4AA)),
     _NavData(icon: Icons.history_rounded,     label: 'History',   index: 2, color: Color(0xFF4FC3F7)),
     _NavData(icon: Icons.people_rounded,      label: 'Employees', index: 3, color: Color(0xFF81C784)),
     _NavData(icon: Icons.bar_chart_rounded,   label: 'Reports',   index: 4, color: Color(0xFFFFB74D)),
@@ -140,7 +253,7 @@ class MainScreenState extends State<MainScreen>
         ),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.4),
+            color: Colors.black.withValues(alpha: 0.4),
             blurRadius: 20,
             offset: const Offset(0, -4),
           ),
@@ -213,7 +326,7 @@ class MainScreenState extends State<MainScreen>
           shape: BoxShape.circle,
           boxShadow: [
             BoxShadow(
-              color: (_menuOpen ? const Color(0xFFFF6B6B) : AppColors.accent).withOpacity(0.4),
+              color: (_menuOpen ? const Color(0xFFFF6B6B) : AppColors.accent).withValues(alpha: 0.4),
               blurRadius: 15,
               spreadRadius: 2,
             ),
@@ -276,7 +389,7 @@ class MainScreenState extends State<MainScreen>
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                         margin: const EdgeInsets.only(bottom: 4),
                         decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.8),
+                          color: Colors.black.withValues(alpha: 0.8),
                           borderRadius: BorderRadius.circular(10),
                         ),
                         child: Text(
@@ -293,7 +406,7 @@ class MainScreenState extends State<MainScreen>
                         border: Border.all(color: item.color, width: 2),
                         boxShadow: [
                           BoxShadow(
-                            color: item.color.withOpacity(0.4),
+                            color: item.color.withValues(alpha: 0.4),
                             blurRadius: 10,
                             spreadRadius: 1,
                           ),

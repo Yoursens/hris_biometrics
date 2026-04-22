@@ -1,5 +1,3 @@
--- SQL Script for HRIS Biometrics Database
--- Create Database
 CREATE DATABASE IF NOT EXISTS hris_biometrics;
 USE hris_biometrics;
 

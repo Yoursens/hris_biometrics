@@ -1,10 +1,11 @@
 // lib/data/local/dao/sync_service.dart
 import 'dart:async';
 import 'dart:convert';
-import 'package:flutter/foundation.dart'; // Added for debugPrint
+import 'package:flutter/foundation.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:http/http.dart' as http;
 import '../../../services/database_service.dart';
 import 'connectivity_service.dart';
 
@@ -81,23 +82,22 @@ class SyncService {
   bool _isSyncing = false;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
+  // IMPORTANT: Replace 'localhost' with your machine's IP address if testing on a real device
+  final String _mysqlSyncUrl = "http://localhost/hris_biometrics/admin_web_portal/sync_attendance.php";
+
   final _eventController = StreamController<SyncEvent>.broadcast();
   Stream<SyncEvent> get events => _eventController.stream;
 
-  // ── Init ─────────────────────────────────────────────────────────────────
-
   Future<void> init() async {
+    if (kIsWeb) return;
     await _ensureTable();
-
-    // Fix any records stuck in 'syncing' state from a previous crash
     await _resetStuckRecords();
-
     _connectivitySub =
         ConnectivityService.instance.onStatusChange.listen((online) async {
           if (online) {
             _eventController.add(SyncEvent(
                 type: SyncEventType.wentOnline,
-                message: 'Back online — uploading pending records...'));
+                message: 'Back online — syncing records...'));
             await syncPending();
           } else {
             final pending = await getPendingCount();
@@ -107,8 +107,6 @@ class SyncService {
                 message: 'Offline mode active'));
           }
         });
-
-    // Try sync on startup if online
     if (ConnectivityService.instance.isOnline) {
       await syncPending();
     }
@@ -116,6 +114,7 @@ class SyncService {
 
   Future<void> _ensureTable() async {
     final db = await DatabaseService.instance.database;
+    if (db == null) return;
     await db.execute('''
       CREATE TABLE IF NOT EXISTS sync_queue (
         id TEXT PRIMARY KEY,
@@ -130,9 +129,9 @@ class SyncService {
     ''');
   }
 
-  /// Resets any records that got stuck in 'syncing' due to a crash/force-close
   Future<void> _resetStuckRecords() async {
     final db = await DatabaseService.instance.database;
+    if (db == null) return;
     await db.update(
       'sync_queue',
       {'status': SyncStatus.pending.name},
@@ -145,11 +144,10 @@ class SyncService {
     _eventController.close();
   }
 
-  // ── Enqueue ───────────────────────────────────────────────────────────────
-
-  /// Saves record to SQLite queue. Immediately syncs if online.
-  Future<String> enqueue(SyncType type, Map<String, dynamic> payload) async {
+  Future<String?> enqueue(SyncType type, Map<String, dynamic> payload) async {
+    if (kIsWeb) return null;
     final db = await DatabaseService.instance.database;
+    if (db == null) return null;
     final id = _uuid.v4();
     await db.insert('sync_queue', {
       'id': id,
@@ -164,9 +162,6 @@ class SyncService {
     _eventController.add(SyncEvent(
       type: SyncEventType.queued,
       pendingCount: pending,
-      message: ConnectivityService.instance.isOnline
-          ? 'Saved — uploading to server...'
-          : 'Saved to device — will sync when online',
     ));
 
     if (ConnectivityService.instance.isOnline) {
@@ -176,15 +171,13 @@ class SyncService {
     return id;
   }
 
-  // ── Sync ──────────────────────────────────────────────────────────────────
-
   Future<void> syncPending() async {
+    if (kIsWeb) return;
     if (_isSyncing) return;
     if (!ConnectivityService.instance.isOnline) return;
 
     final db = await DatabaseService.instance.database;
-
-    // Only pick pending records (not failed — those stay until manually retried)
+    if (db == null) return;
     final rows = await db.query(
       'sync_queue',
       where: "status = 'pending'",
@@ -192,7 +185,6 @@ class SyncService {
     );
 
     if (rows.isEmpty) {
-      // Clear the badge — nothing left to sync
       _eventController.add(SyncEvent(
         type: SyncEventType.syncDone,
         syncedCount: 0,
@@ -209,41 +201,27 @@ class SyncService {
     ));
 
     int success = 0;
-    int failed = 0;
 
     try {
       for (final row in rows) {
         final record = SyncRecord.fromMap(row);
-
-        await db.update(
-          'sync_queue',
-          {
-            'status': SyncStatus.syncing.name,
-            'last_attempt': DateTime.now().toIso8601String(),
-          },
-          where: 'id = ?',
-          whereArgs: [record.id],
-        );
+        await db.update('sync_queue', {'status': SyncStatus.syncing.name, 'last_attempt': DateTime.now().toIso8601String()}, where: 'id = ?', whereArgs: [record.id]);
 
         try {
-          // ── Upload to Firebase Firestore ─────────────────────────────────
-          final uploaded = await _uploadToServer(record);
+          // 1. Sync to Firebase (Using 'clock_ins' for both to merge In and Out data)
+          final fbOk = await _syncToFirebase(record);
+          
+          // 2. Sync to MySQL
+          final mysqlOk = await _syncToMySQL(record);
 
-          if (uploaded) {
-            await db.update(
-              'sync_queue',
-              {'status': SyncStatus.synced.name},
-              where: 'id = ?',
-              whereArgs: [record.id],
-            );
+          if (fbOk && mysqlOk) {
+            await db.update('sync_queue', {'status': SyncStatus.synced.name}, where: 'id = ?', whereArgs: [record.id]);
             success++;
           } else {
-            await _markFailed(db, record, 'Firebase rejected the record');
-            failed++;
+            await _markFailed(db, record, 'Sync failed to targets (FB:$fbOk, SQL:$mysqlOk)');
           }
         } catch (e) {
           await _markFailed(db, record, e.toString());
-          failed++;
         }
       }
     } finally {
@@ -251,41 +229,56 @@ class SyncService {
     }
 
     final remaining = await getPendingCount();
-
     _eventController.add(SyncEvent(
       type: success > 0 ? SyncEventType.syncDone : SyncEventType.syncFailed,
       syncedCount: success,
       pendingCount: remaining,
-      message: success > 0
-          ? '$success record(s) saved to Firebase ✓'
-          : 'Sync failed — tap Retry in queue',
     ));
 
     if (success > 0) await _cleanup(db);
   }
 
-  /// Uploads attendance records to Firebase Firestore
-  Future<bool> _uploadToServer(SyncRecord record) async {
+  Future<bool> _syncToFirebase(SyncRecord record) async {
     try {
-      final collection = record.type == SyncType.clockIn ? 'clock_ins' : 'clock_outs';
+      // Use 'clock_ins' for both types so that Clock In and Clock Out merge into one document per session
+      const collection = 'clock_ins';
+      final docId = record.payload['attendance_id'];
       
-      // Add record to Firestore
-      await _firestore.collection(collection).doc(record.id).set({
+      await _firestore.collection(collection).doc(docId).set({
         ...record.payload,
-        'sync_id': record.id,
         'synced_at': FieldValue.serverTimestamp(),
-      });
+      }, SetOptions(merge: true));
       
       return true;
     } catch (e) {
-      debugPrint('Firestore upload error: $e');
+      debugPrint('Firebase Sync Error: $e');
       return false;
     }
   }
 
-  Future<void> _markFailed(
-      Database db, SyncRecord record, String error) async {
-    // Mark permanently failed — won't auto-retry, user must tap Retry
+  Future<bool> _syncToMySQL(SyncRecord record) async {
+    try {
+      final response = await http.post(
+        Uri.parse(_mysqlSyncUrl),
+        body: {
+          'attendance_id': record.payload['attendance_id']?.toString() ?? '',
+          'employee_id':   record.payload['employee_id']?.toString() ?? '',
+          'employee_name': record.payload['employee_name']?.toString() ?? '',
+          'time_in':       record.payload['time_in']?.toString() ?? '',
+          'time_out':      record.payload['time_out']?.toString() ?? '',
+          'date':          record.payload['date']?.toString() ?? '',
+          'status':        record.payload['status']?.toString() ?? 'present',
+        },
+      ).timeout(const Duration(seconds: 10));
+
+      return response.statusCode == 200;
+    } catch (e) {
+      debugPrint('MySQL Sync Error: $e');
+      return false;
+    }
+  }
+
+  Future<void> _markFailed(Database db, SyncRecord record, String error) async {
     await db.update(
       'sync_queue',
       {
@@ -300,51 +293,23 @@ class SyncService {
   }
 
   Future<void> _cleanup(Database db) async {
-    // Keep synced records for 7 days, then auto-delete
-    final cutoff = DateTime.now()
-        .subtract(const Duration(days: 7))
-        .toIso8601String();
-    await db.delete(
-      'sync_queue',
-      where: "status = 'synced' AND created_at < ?",
-      whereArgs: [cutoff],
-    );
+    final cutoff = DateTime.now().subtract(const Duration(days: 7)).toIso8601String();
+    await db.delete('sync_queue', where: "status = 'synced' AND created_at < ?", whereArgs: [cutoff]);
   }
 
-  // ── Queries ───────────────────────────────────────────────────────────────
-
   Future<int> getPendingCount() async {
+    if (kIsWeb) return 0;
     final db = await DatabaseService.instance.database;
-    final r = await db.rawQuery(
-        "SELECT COUNT(*) as c FROM sync_queue WHERE status = 'pending'");
+    if (db == null) return 0;
+    final r = await db.rawQuery("SELECT COUNT(*) as c FROM sync_queue WHERE status = 'pending'");
     return (r.first['c'] as int?) ?? 0;
   }
 
   Future<List<SyncRecord>> getRecentQueue({int limit = 30}) async {
+    if (kIsWeb) return [];
     final db = await DatabaseService.instance.database;
-    final rows = await db.query('sync_queue',
-        orderBy: 'created_at DESC', limit: limit);
+    if (db == null) return [];
+    final rows = await db.query('sync_queue', orderBy: 'created_at DESC', limit: limit);
     return rows.map(SyncRecord.fromMap).toList();
-  }
-
-  /// Resets all FAILED records back to pending and retries immediately
-  Future<void> retryFailed() async {
-    final db = await DatabaseService.instance.database;
-    await db.update(
-      'sync_queue',
-      {
-        'status': SyncStatus.pending.name,
-        'retry_count': 0,
-        'error_message': null,
-      },
-      where: "status = 'failed'",
-    );
-    await syncPending();
-  }
-
-  /// Clears all synced records from the queue (housekeeping)
-  Future<void> clearSynced() async {
-    final db = await DatabaseService.instance.database;
-    await db.delete('sync_queue', where: "status = 'synced'");
   }
 }

@@ -9,6 +9,61 @@ import 'geofence_service.dart';
 import 'alarm_service.dart';
 import 'security_service.dart';
 
+@pragma('vm:entry-point')
+void onStart(ServiceInstance service) async {
+  DartPluginRegistrant.ensureInitialized();
+
+  final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+
+  // Check every 30 seconds for higher responsiveness during testing
+  Timer.periodic(const Duration(seconds: 30), (timer) async {
+    final now = DateTime.now();
+    
+    // TARGET DEADLINE: 9:30 PM (21:30)
+    // ALARM START: 9:00 PM (21:00) - 30 minutes before
+    
+    // Check if current time is between 9:00 PM (21:00) and 9:30 PM (21:30)
+    final bool isAlarmWindow = (now.hour == 21 && now.minute >= 0 && now.minute < 30);
+
+    if (isAlarmWindow) {
+      final empId = await SecurityService.instance.getCurrentEmployeeId();
+      if (empId == null) return;
+
+      final todayAtt = await DatabaseService.instance.getTodayAttendance(empId);
+      final isClockedIn = todayAtt?.isClockedIn ?? false;
+
+      if (!isClockedIn) {
+        final geo = GeofenceService.instance;
+        final geoResult = await geo.checkGeofence();
+
+        // Alarm if OUTSIDE radius
+        if (!geoResult.isInside) {
+          // Trigger the alarm sound and vibration
+          AlarmService.instance.startAlarm();
+
+          flutterLocalNotificationsPlugin.show(
+            AppBackgroundService.notificationId,
+            'WARNING: 9:30 PM DEADLINE',
+            'Alarm active! You have ${30 - now.minute} minutes left to time in at the office.',
+            const NotificationDetails(
+              android: AndroidNotificationDetails(
+                AppBackgroundService.notificationChannelId,
+                'HRIS Background Service',
+                ongoing: true,
+                importance: Importance.max,
+                priority: Priority.high,
+                fullScreenIntent: true,
+                audioAttributesUsage: AudioAttributesUsage.alarm,
+              ),
+            ),
+          );
+        }
+      }
+    }
+  });
+}
+
 class AppBackgroundService {
   static const notificationId = 888;
   static const notificationChannelId = 'hris_foreground';
@@ -20,7 +75,7 @@ class AppBackgroundService {
       notificationChannelId,
       'HRIS Background Service',
       description: 'Monitoring attendance and location.',
-      importance: Importance.low,
+      importance: Importance.high,
     );
 
     final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
@@ -37,8 +92,8 @@ class AppBackgroundService {
         autoStart: true,
         isForegroundMode: true,
         notificationChannelId: notificationChannelId,
-        initialNotificationTitle: 'HRIS Active',
-        initialNotificationContent: 'Monitoring status...',
+        initialNotificationTitle: 'HRIS Monitoring Active',
+        initialNotificationContent: 'Waiting for alarm window...',
         foregroundServiceNotificationId: notificationId,
       ),
       iosConfiguration: IosConfiguration(
@@ -54,54 +109,5 @@ class AppBackgroundService {
   @pragma('vm:entry-point')
   static Future<bool> onIosBackground(ServiceInstance service) async {
     return true;
-  }
-
-  @pragma('vm:entry-point')
-  static void onStart(ServiceInstance service) async {
-    DartPluginRegistrant.ensureInitialized();
-
-    final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
-        FlutterLocalNotificationsPlugin();
-
-    Timer.periodic(const Duration(minutes: 5), (timer) async {
-      final now = DateTime.now();
-      
-      // CONDITION 1: Before 8:00 PM (20:00)
-      if (now.hour >= 20) return;
-
-      final empId = await SecurityService.instance.getCurrentEmployeeId();
-      if (empId == null) return;
-
-      final todayAtt = await DatabaseService.instance.getTodayAttendance(empId);
-      final isClockedIn = todayAtt?.isClockedIn ?? false;
-
-      // CONDITION 2: Not clocked in
-      if (!isClockedIn) {
-        final geo = GeofenceService.instance;
-        final geoResult = await geo.checkGeofence();
-
-        // CONDITION 3: Outside radius
-        if (!geoResult.isInside) {
-          // Trigger Alarm even if app is closed
-          AlarmService.instance.startAlarm();
-
-          flutterLocalNotificationsPlugin.show(
-            notificationId,
-            'ATTENTION: Alarm Triggered',
-            'You are outside the radius and not timed in before 8 PM. Please open the app and stop the alarm.',
-            const NotificationDetails(
-              android: AndroidNotificationDetails(
-                notificationChannelId,
-                'HRIS Background Service',
-                icon: 'ic_bg_service_small',
-                ongoing: true,
-                importance: Importance.max,
-                priority: Priority.high,
-              ),
-            ),
-          );
-        }
-      }
-    });
   }
 }
