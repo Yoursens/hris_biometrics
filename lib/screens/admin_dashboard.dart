@@ -78,6 +78,16 @@ class _AdminDashboardState extends State<AdminDashboard> {
   String _search   = '';
   final  _searchCtrl = TextEditingController();
 
+  // ── FIX: controllers and form key lifted here so they survive rebuilds ──
+  final _firstNameCtrl = TextEditingController();
+  final _lastNameCtrl  = TextEditingController();
+  final _emailCtrl     = TextEditingController();
+  final _roleCtrl      = TextEditingController();
+  final _nfcCtrl       = TextEditingController();
+  final _pinCtrl       = TextEditingController();
+  final _addEmpFormKey = GlobalKey<FormState>();
+  bool  _addEmpSaving  = false;
+
   List<Map<String, dynamic>> _regLogs    = [];
   List<Map<String, dynamic>> _loginLogs  = [];
   List<Map<String, dynamic>> _logoutLogs = [];
@@ -115,6 +125,13 @@ class _AdminDashboardState extends State<AdminDashboard> {
   void dispose() {
     _poll?.cancel();
     _searchCtrl.dispose();
+    // ── FIX: dispose the form controllers ──
+    _firstNameCtrl.dispose();
+    _lastNameCtrl.dispose();
+    _emailCtrl.dispose();
+    _roleCtrl.dispose();
+    _nfcCtrl.dispose();
+    _pinCtrl.dispose();
     super.dispose();
   }
 
@@ -500,240 +517,226 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   // ═══════════════════════════════════════════════════════════════════════════
   // ADD EMPLOYEE  (firstName, lastName, email, role, nfcTagId, pin)
+  // FIX: No local controllers — all controllers live in the State class above
+  //      so they are never recreated on rebuild.
   // ═══════════════════════════════════════════════════════════════════════════
   Widget _buildAddEmployee() {
-    final firstNameCtrl = TextEditingController();
-    final lastNameCtrl  = TextEditingController();
-    final emailCtrl     = TextEditingController();
-    final roleCtrl      = TextEditingController();
-    final nfcCtrl       = TextEditingController();   // keyfob serial number
-    final pinCtrl       = TextEditingController();   // 4-digit PIN
-    final formKey       = GlobalKey<FormState>();
+    return _pageScroll(title: 'Add Employee', child: Form(
+      key: _addEmpFormKey,
+      child: Container(
+        decoration: BS.card(),
+        padding: const EdgeInsets.all(BS.s4),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
 
-    return _pageScroll(title: 'Add Employee', child: StatefulBuilder(
-      builder: (ctx, localSet) {
-        bool saving = false;
+          // ── card header ──────────────────────────────────────────────
+          Row(children: [
+            Container(
+              padding: const EdgeInsets.all(9),
+              decoration: BoxDecoration(
+                color: BS.primary.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(BS.radius),
+              ),
+              child: Icon(Icons.person_add_rounded, color: BS.primary, size: 22),
+            ),
+            const SizedBox(width: 14),
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('New Employee', style: TextStyle(
+                color: BS.dark, fontWeight: FontWeight.w700, fontSize: BS.textLg,
+              )),
+              Text('All starred fields are required',
+                  style: TextStyle(color: BS.muted, fontSize: BS.textSm)),
+            ]),
+          ]),
+          const SizedBox(height: BS.s4),
+          const Divider(),
+          const SizedBox(height: BS.s3),
 
-        return Form(
-          key: formKey,
-          child: Container(
-            decoration: BS.card(),
-            padding: const EdgeInsets.all(BS.s4),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // ── section: personal info ────────────────────────────────────
+          _sectionHeading('Personal Information'),
+          const SizedBox(height: BS.s3),
 
-              // ── card header ──────────────────────────────────────────────
-              Row(children: [
-                Container(
-                  padding: const EdgeInsets.all(9),
-                  decoration: BoxDecoration(
-                    color: BS.primary.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(BS.radius),
-                  ),
-                  child: Icon(Icons.person_add_rounded, color: BS.primary, size: 22),
-                ),
-                const SizedBox(width: 14),
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('New Employee', style: TextStyle(
-                    color: BS.dark, fontWeight: FontWeight.w700, fontSize: BS.textLg,
-                  )),
-                  Text('All starred fields are required',
-                      style: TextStyle(color: BS.muted, fontSize: BS.textSm)),
-                ]),
-              ]),
-              const SizedBox(height: BS.s4),
-              const Divider(),
-              const SizedBox(height: BS.s3),
-
-              // ── section: personal info ────────────────────────────────────
-              _sectionHeading('Personal Information'),
-              const SizedBox(height: BS.s3),
-
-              LayoutBuilder(builder: (_, c) {
-                final wide = c.maxWidth > 500;
-                if (wide) {
-                  return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Expanded(child: _validatedField(
-                      label: 'First Name *',
-                      hint: 'e.g. Juan',
-                      ctrl: firstNameCtrl,
-                      validator: (v) => (v == null || v.trim().isEmpty) ? 'First name is required' : null,
-                    )),
-                    const SizedBox(width: BS.s3),
-                    Expanded(child: _validatedField(
-                      label: 'Last Name *',
-                      hint: 'e.g. Dela Cruz',
-                      ctrl: lastNameCtrl,
-                      validator: (v) => (v == null || v.trim().isEmpty) ? 'Last name is required' : null,
-                    )),
-                  ]);
-                }
-                return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  _validatedField(
-                    label: 'First Name *',
-                    hint: 'e.g. Juan',
-                    ctrl: firstNameCtrl,
-                    validator: (v) => (v == null || v.trim().isEmpty) ? 'First name is required' : null,
-                  ),
-                  const SizedBox(height: BS.s3),
-                  _validatedField(
-                    label: 'Last Name *',
-                    hint: 'e.g. Dela Cruz',
-                    ctrl: lastNameCtrl,
-                    validator: (v) => (v == null || v.trim().isEmpty) ? 'Last name is required' : null,
-                  ),
-                ]);
-              }),
-              const SizedBox(height: BS.s3),
-
+          LayoutBuilder(builder: (_, c) {
+            final wide = c.maxWidth > 500;
+            if (wide) {
+              return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Expanded(child: _validatedField(
+                  label: 'First Name *',
+                  hint: 'e.g. Juan',
+                  ctrl: _firstNameCtrl,
+                  validator: (v) => (v == null || v.trim().isEmpty) ? 'First name is required' : null,
+                )),
+                const SizedBox(width: BS.s3),
+                Expanded(child: _validatedField(
+                  label: 'Last Name *',
+                  hint: 'e.g. Dela Cruz',
+                  ctrl: _lastNameCtrl,
+                  validator: (v) => (v == null || v.trim().isEmpty) ? 'Last name is required' : null,
+                )),
+              ]);
+            }
+            return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               _validatedField(
-                label: 'Email Address',
-                hint: 'juan@company.com',
-                ctrl: emailCtrl,
-                inputType: TextInputType.emailAddress,
+                label: 'First Name *',
+                hint: 'e.g. Juan',
+                ctrl: _firstNameCtrl,
+                validator: (v) => (v == null || v.trim().isEmpty) ? 'First name is required' : null,
+              ),
+              const SizedBox(height: BS.s3),
+              _validatedField(
+                label: 'Last Name *',
+                hint: 'e.g. Dela Cruz',
+                ctrl: _lastNameCtrl,
+                validator: (v) => (v == null || v.trim().isEmpty) ? 'Last name is required' : null,
+              ),
+            ]);
+          }),
+          const SizedBox(height: BS.s3),
+
+          _validatedField(
+            label: 'Email Address',
+            hint: 'juan@company.com',
+            ctrl: _emailCtrl,
+            inputType: TextInputType.emailAddress,
+            validator: (v) {
+              if (v == null || v.trim().isEmpty) return null; // optional
+              if (!v.contains('@')) return 'Enter a valid email';
+              return null;
+            },
+          ),
+          const SizedBox(height: BS.s3),
+
+          _validatedField(
+            label: 'Role in Company *',
+            hint: 'e.g. Software Engineer, HR Manager',
+            ctrl: _roleCtrl,
+            validator: (v) => (v == null || v.trim().isEmpty) ? 'Role is required' : null,
+          ),
+          const SizedBox(height: BS.s4),
+
+          // ── section: biometric credentials ───────────────────────────
+          _sectionHeading('Biometric Credentials'),
+          const SizedBox(height: BS.s2),
+          Container(
+            padding: const EdgeInsets.all(BS.s3),
+            decoration: BoxDecoration(
+              color: BS.info.withOpacity(0.06),
+              borderRadius: BorderRadius.circular(BS.radius),
+              border: Border.all(color: BS.info.withOpacity(0.25)),
+            ),
+            child: Row(children: [
+              Icon(Icons.info_outline, color: BS.info, size: 16),
+              const SizedBox(width: 10),
+              Expanded(child: Text(
+                'The keyfob serial number and PIN are used by the login screen '
+                    'to authenticate the employee via NFC tap or PIN entry.',
+                style: TextStyle(color: BS.dark, fontSize: BS.textSm, height: 1.5),
+              )),
+            ]),
+          ),
+          const SizedBox(height: BS.s3),
+
+          LayoutBuilder(builder: (_, c) {
+            final wide = c.maxWidth > 500;
+            if (wide) {
+              return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Expanded(child: _validatedField(
+                  label: 'Keyfob Serial Number (NFC) *',
+                  hint: 'e.g. A1:B2:C3:D4',
+                  ctrl: _nfcCtrl,
+                  inputCapitalization: TextCapitalization.characters,
+                  prefixIcon: Icons.contactless_rounded,
+                  validator: (v) => (v == null || v.trim().isEmpty)
+                      ? 'Keyfob serial is required' : null,
+                )),
+                const SizedBox(width: BS.s3),
+                Expanded(child: _validatedField(
+                  label: '4-Digit PIN *',
+                  hint: '••••',
+                  ctrl: _pinCtrl,
+                  obscure: true,
+                  inputType: TextInputType.number,
+                  maxLength: 4,
+                  prefixIcon: Icons.lock_outline_rounded,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  validator: (v) {
+                    if (v == null || v.isEmpty) return 'PIN is required';
+                    if (v.length != 4) return 'PIN must be exactly 4 digits';
+                    return null;
+                  },
+                )),
+              ]);
+            }
+            return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _validatedField(
+                label: 'Keyfob Serial Number (NFC) *',
+                hint: 'e.g. A1:B2:C3:D4',
+                ctrl: _nfcCtrl,
+                inputCapitalization: TextCapitalization.characters,
+                prefixIcon: Icons.contactless_rounded,
+                validator: (v) => (v == null || v.trim().isEmpty)
+                    ? 'Keyfob serial is required' : null,
+              ),
+              const SizedBox(height: BS.s3),
+              _validatedField(
+                label: '4-Digit PIN *',
+                hint: '••••',
+                ctrl: _pinCtrl,
+                obscure: true,
+                inputType: TextInputType.number,
+                maxLength: 4,
+                prefixIcon: Icons.lock_outline_rounded,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                 validator: (v) {
-                  if (v == null || v.trim().isEmpty) return null; // optional
-                  if (!v.contains('@')) return 'Enter a valid email';
+                  if (v == null || v.isEmpty) return 'PIN is required';
+                  if (v.length != 4) return 'PIN must be exactly 4 digits';
                   return null;
                 },
               ),
-              const SizedBox(height: BS.s3),
+            ]);
+          }),
+          const SizedBox(height: BS.s4),
 
-              _validatedField(
-                label: 'Role in Company *',
-                hint: 'e.g. Software Engineer, HR Manager',
-                ctrl: roleCtrl,
-                validator: (v) => (v == null || v.trim().isEmpty) ? 'Role is required' : null,
+          // ── submit button ────────────────────────────────────────────
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: BS.primary,
+                foregroundColor: BS.white,
+                disabledBackgroundColor: BS.primary.withOpacity(0.6),
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(BS.radius)),
+                elevation: 0,
               ),
-              const SizedBox(height: BS.s4),
-
-              // ── section: biometric credentials ───────────────────────────
-              _sectionHeading('Biometric Credentials'),
-              const SizedBox(height: BS.s2),
-              Container(
-                padding: const EdgeInsets.all(BS.s3),
-                decoration: BoxDecoration(
-                  color: BS.info.withOpacity(0.06),
-                  borderRadius: BorderRadius.circular(BS.radius),
-                  border: Border.all(color: BS.info.withOpacity(0.25)),
-                ),
-                child: Row(children: [
-                  Icon(Icons.info_outline, color: BS.info, size: 16),
-                  const SizedBox(width: 10),
-                  Expanded(child: Text(
-                    'The keyfob serial number and PIN are used by the login screen '
-                        'to authenticate the employee via NFC tap or PIN entry.',
-                    style: TextStyle(color: BS.dark, fontSize: BS.textSm, height: 1.5),
-                  )),
-                ]),
+              onPressed: _addEmpSaving ? null : () async {
+                if (!_addEmpFormKey.currentState!.validate()) return;
+                setState(() => _addEmpSaving = true);
+                await _addEmployee(
+                  firstName : _firstNameCtrl.text.trim(),
+                  lastName  : _lastNameCtrl.text.trim(),
+                  email     : _emailCtrl.text.trim(),
+                  role      : _roleCtrl.text.trim(),
+                  nfcTagId  : _nfcCtrl.text.trim().toUpperCase(),
+                  pin       : _pinCtrl.text.trim(),
+                );
+                setState(() => _addEmpSaving = false);
+              },
+              icon: _addEmpSaving
+                  ? const SizedBox(
+                  width: 18, height: 18,
+                  child: CircularProgressIndicator(
+                    color: BS.white, strokeWidth: 2,
+                  ))
+                  : const Icon(Icons.person_add_rounded, size: 18),
+              label: Text(
+                _addEmpSaving ? 'Saving…' : 'Add Employee',
+                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
               ),
-              const SizedBox(height: BS.s3),
-
-              LayoutBuilder(builder: (_, c) {
-                final wide = c.maxWidth > 500;
-                if (wide) {
-                  return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Expanded(child: _validatedField(
-                      label: 'Keyfob Serial Number (NFC) *',
-                      hint: 'e.g. A1:B2:C3:D4',
-                      ctrl: nfcCtrl,
-                      inputCapitalization: TextCapitalization.characters,
-                      prefixIcon: Icons.contactless_rounded,
-                      validator: (v) => (v == null || v.trim().isEmpty)
-                          ? 'Keyfob serial is required' : null,
-                    )),
-                    const SizedBox(width: BS.s3),
-                    Expanded(child: _validatedField(
-                      label: '4-Digit PIN *',
-                      hint: '••••',
-                      ctrl: pinCtrl,
-                      obscure: true,
-                      inputType: TextInputType.number,
-                      maxLength: 4,
-                      prefixIcon: Icons.lock_outline_rounded,
-                      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                      validator: (v) {
-                        if (v == null || v.isEmpty) return 'PIN is required';
-                        if (v.length != 4) return 'PIN must be exactly 4 digits';
-                        return null;
-                      },
-                    )),
-                  ]);
-                }
-                return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  _validatedField(
-                    label: 'Keyfob Serial Number (NFC) *',
-                    hint: 'e.g. A1:B2:C3:D4',
-                    ctrl: nfcCtrl,
-                    inputCapitalization: TextCapitalization.characters,
-                    prefixIcon: Icons.contactless_rounded,
-                    validator: (v) => (v == null || v.trim().isEmpty)
-                        ? 'Keyfob serial is required' : null,
-                  ),
-                  const SizedBox(height: BS.s3),
-                  _validatedField(
-                    label: '4-Digit PIN *',
-                    hint: '••••',
-                    ctrl: pinCtrl,
-                    obscure: true,
-                    inputType: TextInputType.number,
-                    maxLength: 4,
-                    prefixIcon: Icons.lock_outline_rounded,
-                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                    validator: (v) {
-                      if (v == null || v.isEmpty) return 'PIN is required';
-                      if (v.length != 4) return 'PIN must be exactly 4 digits';
-                      return null;
-                    },
-                  ),
-                ]);
-              }),
-              const SizedBox(height: BS.s4),
-
-              // ── submit button ────────────────────────────────────────────
-              SizedBox(
-                width: double.infinity,
-                child: StatefulBuilder(builder: (ctx2, btnSet) {
-                  return ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: BS.primary,
-                      foregroundColor: BS.white,
-                      disabledBackgroundColor: BS.primary.withOpacity(0.6),
-                      padding: const EdgeInsets.symmetric(vertical: 15),
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(BS.radius)),
-                      elevation: 0,
-                    ),
-                    onPressed: saving ? null : () async {
-                      if (!formKey.currentState!.validate()) return;
-                      btnSet(() => saving = true);
-                      await _addEmployee(
-                        firstName : firstNameCtrl.text.trim(),
-                        lastName  : lastNameCtrl.text.trim(),
-                        email     : emailCtrl.text.trim(),
-                        role      : roleCtrl.text.trim(),
-                        nfcTagId  : nfcCtrl.text.trim().toUpperCase(),
-                        pin       : pinCtrl.text.trim(),
-                      );
-                      btnSet(() => saving = false);
-                    },
-                    icon: saving
-                        ? const SizedBox(
-                        width: 18, height: 18,
-                        child: CircularProgressIndicator(
-                          color: BS.white, strokeWidth: 2,
-                        ))
-                        : const Icon(Icons.person_add_rounded, size: 18),
-                    label: Text(
-                      saving ? 'Saving…' : 'Add Employee',
-                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
-                    ),
-                  );
-                }),
-              ),
-            ]),
+            ),
           ),
-        );
-      },
+        ]),
+      ),
     ));
   }
 
@@ -769,11 +772,11 @@ class _AdminDashboardState extends State<AdminDashboard> {
       await FirebaseFirestore.instance.collection('employees').add({
         'firstName'  : firstName,
         'lastName'   : lastName,
-        'name'       : '$firstName $lastName',        // convenience full-name field
+        'name'       : '$firstName $lastName',
         'email'      : email,
         'role'       : role,
-        'nfcTagId'   : nfcTagId,                      // matches login_screen NFC lookup
-        'pin'        : pin,                            // matches login_screen PIN lookup
+        'nfcTagId'   : nfcTagId,
+        'pin'        : pin,
         'status'     : 'active',
         'createdAt'  : FieldValue.serverTimestamp(),
         'updatedAt'  : FieldValue.serverTimestamp(),
@@ -788,6 +791,14 @@ class _AdminDashboardState extends State<AdminDashboard> {
         'timestamp'     : FieldValue.serverTimestamp(),
         'device'        : 'Admin Panel',
       });
+
+      // Clear all form fields after successful save
+      _firstNameCtrl.clear();
+      _lastNameCtrl.clear();
+      _emailCtrl.clear();
+      _roleCtrl.clear();
+      _nfcCtrl.clear();
+      _pinCtrl.clear();
 
       _snack('Employee "$firstName $lastName" added successfully!');
       _fetchAll();
@@ -1053,7 +1064,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
     fontWeight: FontWeight.w700, letterSpacing: 0.2,
   ));
 
-  /// Full-featured validated form field
   Widget _validatedField({
     required String label,
     required String hint,
