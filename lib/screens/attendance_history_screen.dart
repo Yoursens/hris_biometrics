@@ -1,7 +1,14 @@
 // lib/screens/attendance_history_screen.dart
+//
+// FIX: Web now reads from `activity_logs` (type=login / type=logout)
+//      which is exactly what admin_dashboard.dart and login_screen.dart write to.
+//      No `on FirebaseException catch` anywhere (Flutter Web safe).
+
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:intl/intl.dart';
 import '../theme/app_theme.dart';
 import '../services/database_service.dart';
@@ -11,46 +18,80 @@ import '../data/local/dao/connectivity_service.dart';
 import '../models/attendance.dart';
 import '../models/employee.dart';
 
+// ── Design tokens ──────────────────────────────────────────────────────────
+class _C {
+  static const Color navy    = Color(0xFF0A0F2E);
+  static const Color card    = Color(0xFF0F1535);
+  static const Color cardAlt = Color(0xFF131A45);
+  static const Color accent  = Color(0xFF00D4FF);
+  static const Color success = Color(0xFF00E5A0);
+  static const Color warning = Color(0xFFFFBB00);
+  static const Color error   = Color(0xFFFF4D6D);
+  static const Color purple  = Color(0xFF9B6FFF);
+  static const Color white   = Color(0xFFFFFFFF);
+  static const Color white70 = Color(0xB3FFFFFF);
+  static const Color white40 = Color(0x66FFFFFF);
+  static const Color white15 = Color(0x26FFFFFF);
+  static const Color white08 = Color(0x14FFFFFF);
+}
+
 class AttendanceHistoryScreen extends StatefulWidget {
   final Employee? initialEmployee;
   const AttendanceHistoryScreen({super.key, this.initialEmployee});
+
   @override
   State<AttendanceHistoryScreen> createState() =>
       _AttendanceHistoryScreenState();
 }
 
-class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
+class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen>
+    with SingleTickerProviderStateMixin {
+
   Employee? _employee;
-  List<Attendance> _records = [];
-  bool _loading = true;
-  bool _syncing = false;
-  int _pendingCount = 0;
+
+  // Mobile records
+  List<Attendance> _localRecords = [];
+
+  // Web records — built from activity_logs
+  List<Map<String, dynamic>> _loginLogs  = [];
+  List<Map<String, dynamic>> _logoutLogs = [];
+  List<Map<String, dynamic>> _combined   = []; // paired login+logout per day
+
+  bool    _loading  = true;
+  bool    _syncing  = false;
+  int     _pendingCount = 0;
+  String? _error;
+
   StreamSubscription? _syncSub;
   StreamSubscription? _connectSub;
   StreamSubscription? _attendanceSub;
 
+  late TabController _tabController;
+
+  // ── lifecycle ──────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
-    
+    _tabController = TabController(length: kIsWeb ? 3 : 1, vsync: this);
+
     if (!kIsWeb) {
       _syncSub = SyncService.instance.events.listen((e) async {
         if (!mounted) return;
         setState(() => _pendingCount = e.pendingCount);
         if (e.type == SyncEventType.syncDone) {
           await _loadData();
-          if (e.syncedCount > 0)
-            _snack('✓ ${e.syncedCount} record(s) synced', AppColors.success);
+          if (e.syncedCount > 0) {
+            _snack('✓ ${e.syncedCount} record(s) synced', _C.success);
+          }
         }
       });
-
       _connectSub = ConnectivityService.instance.onStatusChange.listen((online) {
         if (mounted && online) _sync();
       });
-
-      _attendanceSub = DatabaseService.instance.onAttendanceChanged.listen((_) {
-        if (mounted) _loadData();
-      });
+      _attendanceSub =
+          DatabaseService.instance.onAttendanceChanged.listen((_) {
+            if (mounted) _loadData();
+          });
     }
 
     _loadData();
@@ -59,32 +100,169 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
 
   @override
   void dispose() {
+    _tabController.dispose();
     _syncSub?.cancel();
     _connectSub?.cancel();
     _attendanceSub?.cancel();
     super.dispose();
   }
 
+  // ── data loading ───────────────────────────────────────────────────────────
   Future<void> _loadData() async {
+    if (!mounted) return;
+    setState(() { _loading = true; _error = null; });
+    try {
+      if (kIsWeb) {
+        await _loadWebData();
+      } else {
+        await _loadMobileData();
+      }
+    } catch (e) {
+      if (mounted) setState(() { _error = e.toString(); _loading = false; });
+    }
+  }
+
+  // ── WEB: reads from `activity_logs` ───────────────────────────────────────
+  //
+  // Fields written by login_screen.dart / admin_dashboard.dart:
+  //   type            : 'login' | 'logout' | 'registration'
+  //   employee_id     : String
+  //   employee_name   : String
+  //   timestamp       : Timestamp  (server timestamp)
+  //   device          : String
+  //
+  Future<void> _loadWebData() async {
+    final emp   = widget.initialEmployee;
+    final empId = emp?.employeeId ?? emp?.id ?? '';
+
+    try {
+      // ── fetch logins ──────────────────────────────────────────────────────
+      // NOTE: No .orderBy() — avoids composite index requirement.
+      // Sorting is done in Dart after fetch.
+      Query loginQuery = FirebaseFirestore.instance
+          .collection('activity_logs')
+          .where('type', isEqualTo: 'login');
+
+      if (empId.isNotEmpty) {
+        loginQuery = loginQuery.where('employee_id', isEqualTo: empId);
+      }
+
+      // ── fetch logouts ─────────────────────────────────────────────────────
+      Query logoutQuery = FirebaseFirestore.instance
+          .collection('activity_logs')
+          .where('type', isEqualTo: 'logout');
+
+      if (empId.isNotEmpty) {
+        logoutQuery = logoutQuery.where('employee_id', isEqualTo: empId);
+      }
+
+      final results = await Future.wait([
+        loginQuery.get(),
+        logoutQuery.get(),
+      ]);
+
+      // Sort by timestamp descending in Dart — no composite index needed
+      int tsSort(Map<String, dynamic> a, Map<String, dynamic> b) {
+        final ta = a['timestamp'];
+        final tb = b['timestamp'];
+        if (ta is Timestamp && tb is Timestamp) return tb.compareTo(ta);
+        return 0;
+      }
+
+      final logins = results[0]
+          .docs
+          .map((d) => {'_docId': d.id, ...d.data() as Map<String, dynamic>})
+          .toList()
+        ..sort(tsSort);
+
+      final logouts = results[1]
+          .docs
+          .map((d) => {'_docId': d.id, ...d.data() as Map<String, dynamic>})
+          .toList()
+        ..sort(tsSort);
+
+      // ── pair logins with logouts by employee + date ───────────────────────
+      //
+      // Strategy: for each login, find the earliest logout from the same
+      // employee on the same calendar date that hasn't been paired yet.
+      //
+      final combined = <Map<String, dynamic>>[];
+      final usedLogoutIds = <String>{};
+
+      for (final login in logins) {
+        final ts = login['timestamp'];
+        DateTime? loginDt;
+        if (ts is Timestamp) loginDt = ts.toDate();
+        final loginDateStr = loginDt != null
+            ? DateFormat('yyyy-MM-dd').format(loginDt) : '';
+        final eid = (login['employee_id'] ?? '').toString();
+
+        // Find a matching logout (same employee, same date, not yet used)
+        Map<String, dynamic>? matchedLogout;
+        for (final logout in logouts) {
+          if (usedLogoutIds.contains(logout['_docId'])) continue;
+          final lts = logout['timestamp'];
+          DateTime? logoutDt;
+          if (lts is Timestamp) logoutDt = lts.toDate();
+          final logoutDateStr = logoutDt != null
+              ? DateFormat('yyyy-MM-dd').format(logoutDt) : '';
+          final leid = (logout['employee_id'] ?? '').toString();
+
+          if (leid == eid && logoutDateStr == loginDateStr) {
+            matchedLogout = logout;
+            usedLogoutIds.add(logout['_docId'].toString());
+            break;
+          }
+        }
+
+        combined.add({
+          'date'          : loginDateStr,
+          'employee_id'   : eid,
+          'employee_name' : (login['employee_name'] ?? '').toString(),
+          'device'        : (login['device'] ?? '').toString(),
+          'login_ts'      : login['timestamp'],
+          'logout_ts'     : matchedLogout?['timestamp'],
+          'has_out'       : matchedLogout != null,
+        });
+      }
+
+      // Already ordered descending by Firestore query
+      if (mounted) {
+        setState(() {
+          _employee   = emp;
+          _loginLogs  = logins;
+          _logoutLogs = logouts;
+          _combined   = combined;
+          _loading    = false;
+        });
+      }
+    } catch (e) {
+      // Plain catch — no typed FirebaseException (Flutter Web safe)
+      debugPrint('_loadWebData error: $e');
+      if (mounted) setState(() { _error = e.toString(); _loading = false; });
+    }
+  }
+
+  // ── Mobile: reads from local SQLite ───────────────────────────────────────
+  Future<void> _loadMobileData() async {
     final empId = await SecurityService.instance.getCurrentEmployeeId();
-    
     Employee? emp = widget.initialEmployee;
     List<Attendance> records = [];
     int pending = 0;
 
-    if (empId != null && !kIsWeb) {
-      emp = await DatabaseService.instance.getEmployeeById(empId);
-      records = await DatabaseService.instance.getAttendanceByEmployee(empId, limit: 90);
+    if (empId != null) {
+      emp     = await DatabaseService.instance.getEmployeeById(empId);
+      records = await DatabaseService.instance
+          .getAttendanceByEmployee(empId, limit: 90);
       pending = await SyncService.instance.getPendingCount();
     }
 
     if (mounted) {
       setState(() {
-        _employee = emp;
-        _records = records;
+        _employee     = emp;
+        _localRecords = records;
         _pendingCount = pending;
-        _loading = false;
-        _syncing = false;
+        _loading      = false;
       });
     }
   }
@@ -94,13 +272,15 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
     if (mounted) setState(() => _syncing = true);
     await DatabaseService.instance.syncLocalFilesToDatabase();
     await SyncService.instance.syncPending();
+    if (mounted) setState(() => _syncing = false);
     await _loadData();
   }
 
   void _snack(String msg, Color color) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(msg, style: const TextStyle(color: Colors.white, fontSize: 13)),
+      content: Text(msg,
+          style: const TextStyle(color: Colors.white, fontSize: 13)),
       backgroundColor: color,
       behavior: SnackBarBehavior.floating,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
@@ -109,363 +289,7 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
     ));
   }
 
-  Map<String, List<Attendance>> get _grouped {
-    final m = <String, List<Attendance>>{};
-    for (final r in _records) {
-      if (r.date.length >= 7) {
-        m.putIfAbsent(r.date.substring(0, 7), () => []).add(r);
-      }
-    }
-    return m;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: AppColors.primary,
-      appBar: AppBar(
-        backgroundColor: AppColors.primary,
-        elevation: 0,
-        leading: kIsWeb ? null : IconButton(
-          icon: const Icon(Icons.arrow_back_rounded, color: AppColors.textPrimary),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('My Attendance',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800,
-                  color: AppColors.textPrimary)),
-          if (_employee != null)
-            Text(_employee!.employeeId,
-                style: const TextStyle(fontSize: 11, color: AppColors.textSecondary)),
-        ]),
-        actions: [
-          if (!kIsWeb && _pendingCount > 0)
-            Center(
-              child: Container(
-                margin: const EdgeInsets.only(right: 4),
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: AppColors.warning.withValues(alpha: 0.15),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: AppColors.warning.withValues(alpha: 0.4)),
-                ),
-                child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  const Icon(Icons.cloud_upload_outlined,
-                      color: AppColors.warning, size: 11),
-                  const SizedBox(width: 3),
-                  Text('$_pendingCount',
-                      style: const TextStyle(fontSize: 10,
-                          color: AppColors.warning, fontWeight: FontWeight.w700)),
-                ]),
-              ),
-            ),
-          if (!kIsWeb)
-            IconButton(
-              tooltip: 'Sync now',
-              icon: _syncing
-                  ? const SizedBox(width: 18, height: 18,
-                  child: CircularProgressIndicator(
-                      color: AppColors.accent, strokeWidth: 2))
-                  : const Icon(Icons.sync_rounded, color: AppColors.accent),
-              onPressed: _syncing ? null : _sync,
-            ),
-        ],
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator(color: AppColors.accent))
-          : _records.isEmpty
-          ? _buildEmpty()
-          : RefreshIndicator(
-        color: AppColors.accent,
-        backgroundColor: AppColors.card,
-        onRefresh: kIsWeb ? () async {} : _sync,
-        child: CustomScrollView(slivers: [
-          if (!kIsWeb) SliverToBoxAdapter(child: _buildSyncBar()),
-          SliverToBoxAdapter(child: _buildTodayCard()),
-          ..._grouped.entries.map((e) =>
-              _buildMonthSection(e.key, e.value)),
-          const SliverToBoxAdapter(child: SizedBox(height: 80)),
-        ]),
-      ),
-    );
-  }
-
-  Widget _buildSyncBar() {
-    final online = ConnectivityService.instance.isOnline;
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: online
-            ? AppColors.success.withValues(alpha: 0.07)
-            : AppColors.warning.withValues(alpha: 0.07),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(
-            color: online
-                ? AppColors.success.withValues(alpha: 0.2)
-                : AppColors.warning.withValues(alpha: 0.2)),
-      ),
-      child: Row(children: [
-        Icon(online ? Icons.cloud_done_rounded : Icons.cloud_off_rounded,
-            color: online ? AppColors.success : AppColors.warning, size: 14),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            online
-                ? 'Online — all records auto-synced to database'
-                : 'Offline — records saved on device, will sync when online',
-            style: TextStyle(
-                fontSize: 11,
-                color: online ? AppColors.success : AppColors.warning),
-          ),
-        ),
-        if (_syncing)
-          const SizedBox(width: 12, height: 12,
-              child: CircularProgressIndicator(
-                  color: AppColors.accent, strokeWidth: 1.5)),
-      ]),
-    );
-  }
-
-  Widget _buildTodayCard() {
-    final todayStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
-    final today = _records.where((r) => r.date == todayStr).firstOrNull;
-
-    return Container(
-      margin: const EdgeInsets.all(16),
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [AppColors.accent.withValues(alpha: 0.15),
-            AppColors.accentSecondary.withValues(alpha: 0.08)],
-          begin: Alignment.topLeft, end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppColors.accent.withValues(alpha: 0.3)),
-      ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          const Text('Today',
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w800,
-                  color: AppColors.accent, letterSpacing: 0.5)),
-          const Spacer(),
-          Text(DateFormat('EEEE, MMMM d, y').format(DateTime.now()),
-              style: const TextStyle(fontSize: 11, color: AppColors.textSecondary)),
-        ]),
-        const SizedBox(height: 14),
-        if (today == null)
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            child: Text(kIsWeb ? 'Attendance tracking limited on Web' : 'No attendance recorded yet today',
-                style: const TextStyle(fontSize: 13, color: AppColors.textMuted)),
-          )
-        else ...[
-          Row(children: [
-            Expanded(child: _BigStampBlock(
-              label: 'CLOCK IN',
-              time: _fmt12(today.timeIn),
-              fullStamp: today.timeIn != null
-                  ? '${today.date}  ${today.timeIn}' : null,
-              color: AppColors.success,
-              icon: Icons.login_rounded,
-            )),
-            const SizedBox(width: 10),
-            Expanded(child: _BigStampBlock(
-              label: 'CLOCK OUT',
-              time: _fmt12(today.timeOut),
-              fullStamp: today.timeOut != null
-                  ? '${today.date}  ${today.timeOut}' : null,
-              color: AppColors.accentSecondary,
-              icon: Icons.logout_rounded,
-            )),
-          ]),
-          const SizedBox(height: 10),
-          Row(children: [
-            _MiniChip(icon: Icons.timer_outlined,
-                label: today.formattedWorkHours, color: AppColors.warning),
-            const SizedBox(width: 6),
-            _MiniChip(icon: _methodIcon(today.method),
-                label: today.method.label, color: AppColors.accent),
-            const SizedBox(width: 6),
-            _MiniChip(icon: _statusIcon(today.status),
-                label: today.status.label,
-                color: _statusColor(today.status)),
-          ]),
-        ],
-      ]),
-    );
-  }
-
-  SliverToBoxAdapter _buildMonthSection(
-      String monthKey, List<Attendance> records) {
-    DateTime? dt;
-    try { dt = DateTime.parse('$monthKey-01'); } catch(_) {}
-    final label = dt != null ? DateFormat('MMMM yyyy').format(dt) : monthKey;
-
-    return SliverToBoxAdapter(
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-          child: Row(children: [
-            Text(label.toUpperCase(),
-                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800,
-                    color: AppColors.textSecondary, letterSpacing: 1)),
-            const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-              decoration: BoxDecoration(
-                  color: AppColors.accent.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(6)),
-              child: Text('${records.length} days',
-                  style: const TextStyle(fontSize: 9,
-                      color: AppColors.accent, fontWeight: FontWeight.w700)),
-            ),
-          ]),
-        ),
-        ...records.map(_buildRow),
-      ]),
-    );
-  }
-
-  Widget _buildRow(Attendance r) {
-    final date = DateTime.tryParse(r.date);
-    final isToday = r.date == DateFormat('yyyy-MM-dd').format(DateTime.now());
-    final statusColor = _statusColor(r.status);
-
-    return GestureDetector(
-      onTap: () => _showDetail(r),
-      child: Container(
-        margin: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: AppColors.card,
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: isToday
-                ? AppColors.accent.withValues(alpha: 0.4)
-                : AppColors.cardBorder,
-            width: isToday ? 1.5 : 1,
-          ),
-        ),
-        child: Row(children: [
-          Container(
-            width: 48,
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            decoration: BoxDecoration(
-              color: isToday
-                  ? AppColors.accent.withValues(alpha: 0.12)
-                  : AppColors.surfaceLight,
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Column(children: [
-              Text(
-                date != null ? DateFormat('EEE').format(date) : '',
-                style: TextStyle(
-                    fontSize: 9,
-                    color: isToday ? AppColors.accent : AppColors.textMuted,
-                    fontWeight: FontWeight.w600),
-              ),
-              Text(
-                date != null ? DateFormat('d').format(date) : '--',
-                style: TextStyle(
-                    fontSize: 20, fontWeight: FontWeight.w800,
-                    color: isToday ? AppColors.accent : AppColors.textPrimary),
-              ),
-            ]),
-          ),
-          const SizedBox(width: 12),
-
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                _StampPill(
-                    label: 'IN',
-                    time: r.timeIn,
-                    color: AppColors.success),
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 6),
-                  child: Icon(Icons.arrow_forward_rounded,
-                      size: 11, color: AppColors.textMuted),
-                ),
-                _StampPill(
-                    label: 'OUT',
-                    time: r.timeOut,
-                    color: AppColors.accentSecondary),
-              ]),
-              const SizedBox(height: 5),
-              Row(children: [
-                Icon(Icons.timer_outlined, size: 10, color: AppColors.textMuted),
-                const SizedBox(width: 3),
-                Text(r.formattedWorkHours,
-                    style: const TextStyle(
-                        fontSize: 10, color: AppColors.textMuted)),
-                const SizedBox(width: 10),
-                Icon(_methodIcon(r.method), size: 10, color: AppColors.textMuted),
-                const SizedBox(width: 3),
-                Text(r.method.label,
-                    style: const TextStyle(
-                        fontSize: 10, color: AppColors.textMuted)),
-              ]),
-            ]),
-          ),
-
-          Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-              decoration: BoxDecoration(
-                  color: statusColor.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(7)),
-              child: Text(r.status.label.toUpperCase(),
-                  style: TextStyle(fontSize: 8, color: statusColor,
-                      fontWeight: FontWeight.w800)),
-            ),
-            const SizedBox(height: 4),
-            const Icon(Icons.chevron_right_rounded,
-                size: 16, color: AppColors.textMuted),
-          ]),
-        ]),
-      ),
-    );
-  }
-
-  void _showDetail(Attendance r) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: AppColors.card,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
-      builder: (_) => _DetailSheet(record: r),
-    );
-  }
-
-  Widget _buildEmpty() {
-    return Center(
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        const Icon(Icons.history_rounded, color: AppColors.textMuted, size: 64),
-        const SizedBox(height: 16),
-        Text(kIsWeb ? 'Attendance History not available on Web' : 'No records yet',
-            style: const TextStyle(fontSize: 16, color: AppColors.textMuted)),
-        const SizedBox(height: 8),
-        Text(kIsWeb ? 'Please use the mobile app to view detailed history' : 'Clock in to start tracking your attendance',
-            style: const TextStyle(fontSize: 13, color: AppColors.textMuted)),
-        if (!kIsWeb) ...[
-          const SizedBox(height: 24),
-          ElevatedButton.icon(
-            onPressed: _sync,
-            style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.accent,
-                foregroundColor: AppColors.primary,
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12))),
-            icon: const Icon(Icons.sync_rounded, size: 16),
-            label: const Text('Sync Records'),
-          ),
-        ]
-      ]),
-    );
-  }
-
+  // ── time helpers ───────────────────────────────────────────────────────────
   String _fmt12(String? t) {
     if (t == null) return '--:--';
     try {
@@ -473,263 +297,934 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
     } catch (_) { return t; }
   }
 
-  Color _statusColor(AttendanceStatus s) {
-    switch (s) {
-      case AttendanceStatus.present: return AppColors.success;
-      case AttendanceStatus.late:    return AppColors.warning;
-      case AttendanceStatus.absent:  return AppColors.error;
-      default:                       return AppColors.textMuted;
+  String _fmtTimestamp(dynamic ts) {
+    if (ts == null) return '--:--';
+    if (ts is Timestamp) {
+      return DateFormat('hh:mm a').format(ts.toDate().toLocal());
     }
+    return '--:--';
   }
 
-  IconData _statusIcon(AttendanceStatus s) {
-    switch (s) {
-      case AttendanceStatus.present: return Icons.check_circle_rounded;
-      case AttendanceStatus.late:    return Icons.schedule_rounded;
-      case AttendanceStatus.absent:  return Icons.cancel_rounded;
-      default:                       return Icons.help_outline_rounded;
+  String _fmtDate(dynamic ts) {
+    if (ts == null) return '—';
+    if (ts is Timestamp) {
+      return DateFormat('EEE, MMM d yyyy').format(ts.toDate().toLocal());
     }
+    return '—';
   }
 
-  IconData _methodIcon(AttendanceMethod m) {
-    switch (m) {
-      case AttendanceMethod.pin:         return Icons.pin_rounded;
-      case AttendanceMethod.fingerprint: return Icons.fingerprint_rounded;
-      case AttendanceMethod.face:        return Icons.face_retouching_natural;
-      case AttendanceMethod.qrCode:      return Icons.qr_code_rounded;
-      case AttendanceMethod.nfc:         return Icons.contactless_rounded;
-      default:                           return Icons.login_rounded;
-    }
+  String _durationFromTs(dynamic loginTs, dynamic logoutTs) {
+    if (loginTs == null || loginTs is! Timestamp) return '--';
+    final start = loginTs.toDate();
+    final end   = logoutTs is Timestamp ? logoutTs.toDate() : DateTime.now();
+    final diff  = end.difference(start);
+    if (diff.isNegative) return '--';
+    return '${diff.inHours}h ${diff.inMinutes % 60}m';
   }
-}
 
-class _DetailSheet extends StatelessWidget {
-  final Attendance record;
-  const _DetailSheet({required this.record});
+  String _durationStr(String? timeIn, String? timeOut, String? date) {
+    if (timeIn == null || date == null) return '--';
+    try {
+      final start = DateTime.parse('${date}T$timeIn');
+      final end   = timeOut != null
+          ? DateTime.parse('${date}T$timeOut') : DateTime.now();
+      final diff  = end.difference(start);
+      if (diff.isNegative) return '--';
+      return '${diff.inHours}h ${diff.inMinutes % 60}m';
+    } catch (_) { return '--'; }
+  }
 
+  // ── build ──────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    final date = DateTime.tryParse(record.date);
-    final dateLabel =
-    date != null ? DateFormat('EEEE, MMMM d, y').format(date) : record.date;
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Container(width: 40, height: 4,
-            decoration: BoxDecoration(color: AppColors.cardBorder,
-                borderRadius: BorderRadius.circular(2))),
-        const SizedBox(height: 16),
-
-        Text(dateLabel,
-            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800,
-                color: AppColors.textPrimary)),
-        const SizedBox(height: 6),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-          decoration: BoxDecoration(
-              color: _sc(record.status).withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(10)),
-          child: Text(record.status.label,
-              style: TextStyle(fontSize: 12, color: _sc(record.status),
-                  fontWeight: FontWeight.w700)),
+    return Scaffold(
+      backgroundColor: _C.navy,
+      body: Column(children: [
+        _buildHeader(),
+        if (kIsWeb) _buildTabBar(),
+        Expanded(
+          child: _loading
+              ? _buildLoader()
+              : _error != null
+              ? _buildError()
+              : kIsWeb
+              ? _buildWebContent()
+              : _buildMobileContent(),
         ),
-        const SizedBox(height: 20),
-
-        _Row(icon: Icons.login_rounded, iconColor: AppColors.success,
-            label: 'Clock In Time',
-            value: _fmt12(record.timeIn),
-            stamp: record.timeIn != null
-                ? '${record.date}  T  ${record.timeIn}' : null),
-        _divider(),
-        _Row(icon: Icons.logout_rounded, iconColor: AppColors.accentSecondary,
-            label: 'Clock Out Time',
-            value: _fmt12(record.timeOut),
-            stamp: record.timeOut != null
-                ? '${record.date}  T  ${record.timeOut}' : null),
-        _divider(),
-        _Row(icon: Icons.timer_outlined, iconColor: AppColors.warning,
-            label: 'Total Work Duration',
-            value: record.formattedWorkHours),
-        _divider(),
-        _Row(icon: _mi(record.method), iconColor: AppColors.accent,
-            label: 'Auth Method',
-            value: record.method.label),
-        _divider(),
-        _Row(icon: Icons.fingerprint_rounded, iconColor: AppColors.textMuted,
-            label: 'Record Saved At',
-            value: DateFormat('MMM d, y · hh:mm a')
-                .format(record.createdAt),
-            stamp: record.createdAt.toIso8601String()),
-        const SizedBox(height: 8),
       ]),
     );
   }
 
-  Widget _divider() =>
-      const Divider(color: AppColors.cardBorder, height: 20);
-
-  String _fmt12(String? t) {
-    if (t == null) return 'Not recorded';
-    try {
-      return DateFormat('hh:mm:ss a').format(DateFormat('HH:mm:ss').parse(t));
-    } catch (_) { return t; }
-  }
-
-  Color _sc(AttendanceStatus s) {
-    switch (s) {
-      case AttendanceStatus.present: return AppColors.success;
-      case AttendanceStatus.late:    return AppColors.warning;
-      case AttendanceStatus.absent:  return AppColors.error;
-      default:                       return AppColors.textMuted;
-    }
-  }
-
-  IconData _mi(AttendanceMethod m) {
-    switch (m) {
-      case AttendanceMethod.pin:         return Icons.pin_rounded;
-      case AttendanceMethod.fingerprint: return Icons.fingerprint_rounded;
-      case AttendanceMethod.face:        return Icons.face_retouching_natural;
-      case AttendanceMethod.qrCode:      return Icons.qr_code_rounded;
-      case AttendanceMethod.nfc:         return Icons.contactless_rounded;
-      default:                           return Icons.login_rounded;
-    }
-  }
-}
-
-class _Row extends StatelessWidget {
-  final IconData icon;
-  final Color iconColor;
-  final String label;
-  final String value;
-  final String? stamp;
-  const _Row({required this.icon, required this.iconColor,
-    required this.label, required this.value, this.stamp});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Container(
-        width: 36, height: 36,
-        decoration: BoxDecoration(
-            color: iconColor.withValues(alpha: 0.12), shape: BoxShape.circle),
-        child: Icon(icon, color: iconColor, size: 18),
+  // ── HEADER ────────────────────────────────────────────────────────────────
+  Widget _buildHeader() {
+    return Container(
+      padding: EdgeInsets.fromLTRB(
+          20, kIsWeb ? 20 : MediaQuery.of(context).padding.top + 16, 20, 16),
+      decoration: BoxDecoration(
+        color: _C.card,
+        border: Border(bottom: BorderSide(color: _C.white15, width: 0.5)),
       ),
-      const SizedBox(width: 12),
-      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(label,
-            style: const TextStyle(fontSize: 11, color: AppColors.textMuted)),
-        const SizedBox(height: 2),
-        Text(value,
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700,
-                color: AppColors.textPrimary)),
-        if (stamp != null) ...[
-          const SizedBox(height: 2),
-          Text(stamp!,
-              style: const TextStyle(fontSize: 10, color: AppColors.textMuted,
-                  fontFamily: 'monospace')),
+      child: Row(children: [
+        Container(
+          width: 40, height: 40,
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(
+                colors: [Color(0xFF00D4FF), Color(0xFF0055BB)]),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: const Icon(Icons.history_rounded, color: Colors.white, size: 20),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Attendance History',
+                style: TextStyle(
+                    color: _C.white, fontSize: 18, fontWeight: FontWeight.w800)),
+            Text(
+              _employee?.fullName ??
+                  widget.initialEmployee?.fullName ??
+                  'All Records',
+              style: const TextStyle(color: _C.white40, fontSize: 12),
+            ),
+          ]),
+        ),
+
+        // Web: refresh button
+        if (kIsWeb)
+          GestureDetector(
+            onTap: _loadData,
+            child: Container(
+              padding:
+              const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: _C.accent.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: _C.accent.withOpacity(0.3)),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.refresh_rounded, color: _C.accent, size: 14),
+                const SizedBox(width: 6),
+                Text('Refresh',
+                    style: TextStyle(
+                        color: _C.accent,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700)),
+              ]),
+            ),
+          ),
+
+        // Mobile: pending badge + sync
+        if (!kIsWeb) ...[
+          if (_pendingCount > 0) ...[
+            Container(
+              padding:
+              const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: _C.warning.withOpacity(0.15),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: _C.warning.withOpacity(0.4)),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.cloud_upload_outlined, color: _C.warning, size: 11),
+                const SizedBox(width: 3),
+                Text('$_pendingCount',
+                    style: TextStyle(
+                        fontSize: 10,
+                        color: _C.warning,
+                        fontWeight: FontWeight.w700)),
+              ]),
+            ),
+            const SizedBox(width: 8),
+          ],
+          GestureDetector(
+            onTap: _syncing ? null : _sync,
+            child: _syncing
+                ? const SizedBox(
+                width: 20, height: 20,
+                child: CircularProgressIndicator(
+                    color: _C.accent, strokeWidth: 2))
+                : const Icon(Icons.sync_rounded, color: _C.accent, size: 22),
+          ),
         ],
-      ])),
+      ]),
+    );
+  }
+
+  // ── TAB BAR ────────────────────────────────────────────────────────────────
+  Widget _buildTabBar() {
+    return Container(
+      color: _C.card,
+      child: TabBar(
+        controller: _tabController,
+        indicatorColor: _C.accent,
+        indicatorWeight: 2,
+        labelColor: _C.accent,
+        unselectedLabelColor: _C.white40,
+        labelStyle:
+        const TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+        tabs: const [
+          Tab(text: 'All Records'),
+          Tab(text: 'Logins'),
+          Tab(text: 'Logouts'),
+        ],
+      ),
+    );
+  }
+
+  // ── LOADER ────────────────────────────────────────────────────────────────
+  Widget _buildLoader() => Center(
+    child: Column(mainAxisSize: MainAxisSize.min, children: [
+      const SizedBox(
+          width: 32, height: 32,
+          child: CircularProgressIndicator(
+              color: _C.accent, strokeWidth: 2.5)),
+      const SizedBox(height: 16),
+      Text('Loading records…',
+          style: TextStyle(color: _C.white40, fontSize: 13)),
+    ]),
+  );
+
+  // ── ERROR ─────────────────────────────────────────────────────────────────
+  Widget _buildError() => Center(
+    child: Padding(
+      padding: const EdgeInsets.all(32),
+      child: Container(
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(
+          color: _C.error.withOpacity(0.08),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: _C.error.withOpacity(0.3)),
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.error_outline_rounded, color: _C.error, size: 40),
+          const SizedBox(height: 12),
+          Text('Failed to load records',
+              style: TextStyle(
+                  color: _C.error,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          Text(_error ?? '',
+              style: TextStyle(color: _C.white40, fontSize: 12),
+              textAlign: TextAlign.center),
+          const SizedBox(height: 16),
+          GestureDetector(
+            onTap: _loadData,
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 20, vertical: 10),
+              decoration: BoxDecoration(
+                  color: _C.accent,
+                  borderRadius: BorderRadius.circular(20)),
+              child: const Text('Retry',
+                  style: TextStyle(
+                      color: Colors.white, fontWeight: FontWeight.w700)),
+            ),
+          ),
+        ]),
+      ),
+    ),
+  );
+
+  // ── STATS ROW ─────────────────────────────────────────────────────────────
+  Widget _buildStatsRow() {
+    final total   = kIsWeb ? _combined.length  : _localRecords.length;
+    final withOut = kIsWeb
+        ? _combined.where((r) => r['has_out'] == true).length
+        : _localRecords.where((r) => r.timeOut != null).length;
+    final active  = total - withOut;
+
+    return Container(
+      margin: const EdgeInsets.all(16),
+      child: Row(children: [
+        _StatChip(label: 'Total',     value: '$total',   color: _C.accent,   icon: Icons.list_alt_rounded),
+        const SizedBox(width: 10),
+        _StatChip(label: 'Completed', value: '$withOut', color: _C.success,  icon: Icons.check_circle_rounded),
+        const SizedBox(width: 10),
+        _StatChip(label: 'Active',    value: '$active',  color: _C.warning,  icon: Icons.timelapse_rounded),
+      ]),
+    );
+  }
+
+  // ── WEB CONTENT ───────────────────────────────────────────────────────────
+  Widget _buildWebContent() {
+    return TabBarView(
+      controller: _tabController,
+      children: [
+        _buildCombinedList(),
+        _buildLoginList(),
+        _buildLogoutList(),
+      ],
+    );
+  }
+
+  // ─ Tab 0: All Records (paired login + logout) ──────────────────────────
+  Widget _buildCombinedList() {
+    if (_combined.isEmpty) {
+      return _buildEmptyState(
+        'No attendance records found',
+        subtitle: 'Login and logout activity will appear here.',
+      );
+    }
+    return ListView(
+      padding: const EdgeInsets.only(bottom: 80),
+      children: [
+        _buildStatsRow(),
+        ..._combined.map((r) => _CombinedCard(
+          record    : r,
+          fmtTs     : _fmtTimestamp,
+          fmtDate   : _fmtDate,
+          durationTs: _durationFromTs,
+        )),
+        const SizedBox(height: 20),
+      ],
+    );
+  }
+
+  // ─ Tab 1: Login logs ───────────────────────────────────────────────────
+  Widget _buildLoginList() {
+    if (_loginLogs.isEmpty) {
+      return _buildEmptyState('No login records found');
+    }
+    return ListView(
+      padding: const EdgeInsets.only(bottom: 80),
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          child: _countBadge(
+              '${_loginLogs.length} Login Records',
+              Icons.login_rounded,
+              _C.success),
+        ),
+        ..._loginLogs.map((r) => _ActivityLogCard(
+          record  : r,
+          type    : 'login',
+          fmtTs   : _fmtTimestamp,
+          fmtDate : _fmtDate,
+        )),
+        const SizedBox(height: 20),
+      ],
+    );
+  }
+
+  // ─ Tab 2: Logout logs ──────────────────────────────────────────────────
+  Widget _buildLogoutList() {
+    if (_logoutLogs.isEmpty) {
+      return _buildEmptyState('No logout records found');
+    }
+    return ListView(
+      padding: const EdgeInsets.only(bottom: 80),
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          child: _countBadge(
+              '${_logoutLogs.length} Logout Records',
+              Icons.logout_rounded,
+              _C.purple),
+        ),
+        ..._logoutLogs.map((r) => _ActivityLogCard(
+          record  : r,
+          type    : 'logout',
+          fmtTs   : _fmtTimestamp,
+          fmtDate : _fmtDate,
+        )),
+        const SizedBox(height: 20),
+      ],
+    );
+  }
+
+  Widget _countBadge(String label, IconData icon, Color color) {
+    return Row(children: [
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: color.withOpacity(0.3)),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(icon, color: color, size: 14),
+          const SizedBox(width: 6),
+          Text(label,
+              style: TextStyle(
+                  color: color, fontSize: 12, fontWeight: FontWeight.w700)),
+        ]),
+      ),
     ]);
   }
+
+  // ── MOBILE CONTENT ────────────────────────────────────────────────────────
+  Widget _buildMobileContent() {
+    if (_localRecords.isEmpty) {
+      return _buildEmptyState('No attendance records yet');
+    }
+
+    final grouped = <String, List<Attendance>>{};
+    for (final r in _localRecords) {
+      if (r.date.length >= 7) {
+        grouped.putIfAbsent(r.date.substring(0, 7), () => []).add(r);
+      }
+    }
+
+    return RefreshIndicator(
+      color: _C.accent,
+      backgroundColor: _C.card,
+      onRefresh: _sync,
+      child: ListView(
+        padding: const EdgeInsets.only(bottom: 80),
+        children: [
+          _buildStatsRow(),
+          ...grouped.entries.expand((e) => [
+            _buildMonthHeader(e.key, e.value.length),
+            ...e.value.map((r) =>
+                _MobileAttendanceCard(record: r, fmt12: _fmt12)),
+          ]),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMonthHeader(String monthKey, int count) {
+    DateTime? dt;
+    try { dt = DateTime.parse('$monthKey-01'); } catch (_) {}
+    final label =
+    dt != null ? DateFormat('MMMM yyyy').format(dt) : monthKey;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+      child: Row(children: [
+        Text(label.toUpperCase(),
+            style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+                color: _C.white40,
+                letterSpacing: 1)),
+        const SizedBox(width: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+          decoration: BoxDecoration(
+            color: _C.accent.withOpacity(0.1),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Text('$count days',
+              style: TextStyle(
+                  fontSize: 9,
+                  color: _C.accent,
+                  fontWeight: FontWeight.w700)),
+        ),
+      ]),
+    );
+  }
+
+  Widget _buildEmptyState(String msg, {String? subtitle}) =>
+      Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.history_rounded, color: _C.white15, size: 56),
+          const SizedBox(height: 16),
+          Text(msg,
+              style: TextStyle(
+                  color: _C.white40,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          Text(
+            subtitle ?? 'Records will appear here once available',
+            style: TextStyle(
+                color: _C.white40.withOpacity(0.6), fontSize: 12),
+            textAlign: TextAlign.center,
+          ),
+          if (kIsWeb) ...[
+            const SizedBox(height: 20),
+            GestureDetector(
+              onTap: _loadData,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 20, vertical: 10),
+                decoration: BoxDecoration(
+                  color: _C.accent.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(20),
+                  border:
+                  Border.all(color: _C.accent.withOpacity(0.3)),
+                ),
+                child: Text('Refresh',
+                    style: TextStyle(
+                        color: _C.accent,
+                        fontWeight: FontWeight.w700)),
+              ),
+            ),
+          ],
+        ]),
+      );
 }
 
-class _BigStampBlock extends StatelessWidget {
+// ══════════════════════════════════════════════════════════════════════════════
+// WEB: Paired login+logout card
+// ══════════════════════════════════════════════════════════════════════════════
+class _CombinedCard extends StatelessWidget {
+  final Map<String, dynamic> record;
+  final String Function(dynamic) fmtTs;
+  final String Function(dynamic) fmtDate;
+  final String Function(dynamic, dynamic) durationTs;
+
+  const _CombinedCard({
+    required this.record,
+    required this.fmtTs,
+    required this.fmtDate,
+    required this.durationTs,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final loginTs   = record['login_ts'];
+    final logoutTs  = record['logout_ts'];
+    final hasOut    = record['has_out'] == true;
+    final empId     = record['employee_id']   as String? ?? '';
+    final empName   = record['employee_name'] as String? ?? '';
+    final device    = record['device']        as String? ?? '';
+    final dateStr   = record['date']          as String? ?? '';
+    final dur       = durationTs(loginTs, logoutTs);
+
+    DateTime? dt;
+    if (dateStr.isNotEmpty) {
+      try { dt = DateTime.parse(dateStr); } catch (_) {}
+    } else if (loginTs is Timestamp) {
+      dt = loginTs.toDate().toLocal();
+    }
+
+    final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+    final isToday = dateStr == today;
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+      decoration: BoxDecoration(
+        color: _C.card,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: isToday
+              ? _C.accent.withOpacity(0.4) : _C.white15,
+          width: isToday ? 1.5 : 0.5,
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(children: [
+          // Date block
+          Container(
+            width: 52, height: 60,
+            decoration: BoxDecoration(
+              color: isToday
+                  ? _C.accent.withOpacity(0.1) : _C.white08,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                  color: isToday
+                      ? _C.accent.withOpacity(0.3) : _C.white15),
+            ),
+            child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    dt != null ? DateFormat('EEE').format(dt) : '--',
+                    style: TextStyle(
+                        fontSize: 9,
+                        color: isToday ? _C.accent : _C.white40,
+                        fontWeight: FontWeight.w700),
+                  ),
+                  Text(
+                    dt != null ? DateFormat('d').format(dt) : '--',
+                    style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.w900,
+                        color: isToday ? _C.accent : _C.white),
+                  ),
+                  Text(
+                    dt != null ? DateFormat('MMM').format(dt) : '--',
+                    style: TextStyle(
+                        fontSize: 9,
+                        color: isToday ? _C.accent : _C.white40,
+                        fontWeight: FontWeight.w600),
+                  ),
+                ]),
+          ),
+          const SizedBox(width: 14),
+
+          // Content
+          Expanded(
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Employee name / ID
+                  if (empName.isNotEmpty)
+                    Text(empName,
+                        style: const TextStyle(
+                            color: _C.white,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700),
+                        overflow: TextOverflow.ellipsis),
+                  if (empId.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(empId,
+                        style: TextStyle(
+                            fontSize: 10,
+                            color: _C.accent,
+                            fontWeight: FontWeight.w600)),
+                  ],
+                  const SizedBox(height: 8),
+
+                  // Login → Logout chips
+                  Row(children: [
+                    _TimeChip(
+                        label: 'IN',
+                        time: fmtTs(loginTs),
+                        color: _C.success),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 8),
+                      child: Icon(Icons.arrow_forward_rounded,
+                          size: 12, color: _C.white40),
+                    ),
+                    _TimeChip(
+                        label: 'OUT',
+                        time: hasOut ? fmtTs(logoutTs) : 'ACTIVE',
+                        color: hasOut ? _C.purple : _C.warning),
+                  ]),
+                  const SizedBox(height: 8),
+
+                  // Duration + status
+                  Row(children: [
+                    const Icon(Icons.timer_outlined,
+                        size: 11, color: _C.white40),
+                    const SizedBox(width: 4),
+                    Text(dur,
+                        style: TextStyle(
+                            fontSize: 11, color: _C.white40)),
+                    const SizedBox(width: 10),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 7, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: hasOut
+                            ? _C.success.withOpacity(0.1)
+                            : _C.warning.withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        hasOut ? 'COMPLETE' : 'ACTIVE',
+                        style: TextStyle(
+                            fontSize: 8,
+                            color: hasOut ? _C.success : _C.warning,
+                            fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                    if (device.isNotEmpty) ...[
+                      const SizedBox(width: 8),
+                      Icon(
+                        device.toLowerCase().contains('web')
+                            ? Icons.computer_rounded
+                            : Icons.phone_android_rounded,
+                        color: _C.white40,
+                        size: 11,
+                      ),
+                    ],
+                  ]),
+                ]),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WEB: Individual activity_log card (login or logout)
+// ══════════════════════════════════════════════════════════════════════════════
+class _ActivityLogCard extends StatelessWidget {
+  final Map<String, dynamic> record;
+  final String type; // 'login' | 'logout'
+  final String Function(dynamic) fmtTs;
+  final String Function(dynamic) fmtDate;
+
+  const _ActivityLogCard({
+    required this.record,
+    required this.type,
+    required this.fmtTs,
+    required this.fmtDate,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isLogin  = type == 'login';
+    final color    = isLogin ? _C.success : _C.purple;
+    final ts       = record['timestamp'];
+    final empId    = (record['employee_id']   ?? '').toString();
+    final empName  = (record['employee_name'] ?? '').toString();
+    final device   = (record['device']        ?? '').toString();
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _C.card,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _C.white15, width: 0.5),
+      ),
+      child: Row(children: [
+        // Icon badge
+        Container(
+          width: 44, height: 44,
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.1),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: color.withOpacity(0.3)),
+          ),
+          child: Icon(
+            isLogin ? Icons.login_rounded : Icons.logout_rounded,
+            color: color, size: 20,
+          ),
+        ),
+        const SizedBox(width: 12),
+
+        Expanded(
+          child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Date + time
+                Row(children: [
+                  Expanded(
+                    child: Text(fmtDate(ts),
+                        style: const TextStyle(
+                            color: _C.white,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700)),
+                  ),
+                  Text(fmtTs(ts),
+                      style: TextStyle(
+                          color: color,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w900)),
+                ]),
+                const SizedBox(height: 5),
+
+                // Employee info + device
+                Row(children: [
+                  if (empName.isNotEmpty) ...[
+                    const Icon(Icons.person_outline_rounded,
+                        size: 10, color: _C.white40),
+                    const SizedBox(width: 4),
+                    Flexible(
+                      child: Text(empName,
+                          style: TextStyle(
+                              fontSize: 11, color: _C.white70),
+                          overflow: TextOverflow.ellipsis),
+                    ),
+                    const SizedBox(width: 10),
+                  ],
+                  if (empId.isNotEmpty) ...[
+                    const Icon(Icons.badge_outlined,
+                        size: 10, color: _C.white40),
+                    const SizedBox(width: 4),
+                    Text(empId,
+                        style: TextStyle(
+                            fontSize: 10, color: _C.white40)),
+                    const SizedBox(width: 10),
+                  ],
+                  if (device.isNotEmpty)
+                    Row(children: [
+                      Icon(
+                        device.toLowerCase().contains('web')
+                            ? Icons.computer_rounded
+                            : Icons.phone_android_rounded,
+                        size: 10,
+                        color: _C.white40,
+                      ),
+                      const SizedBox(width: 3),
+                      Text(device,
+                          style: TextStyle(
+                              fontSize: 10, color: _C.white40)),
+                    ]),
+                ]),
+              ]),
+        ),
+      ]),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MOBILE: attendance card
+// ══════════════════════════════════════════════════════════════════════════════
+class _MobileAttendanceCard extends StatelessWidget {
+  final Attendance record;
+  final String Function(String?) fmt12;
+  const _MobileAttendanceCard(
+      {required this.record, required this.fmt12});
+
+  @override
+  Widget build(BuildContext context) {
+    final date    = DateTime.tryParse(record.date);
+    final isToday =
+        record.date == DateFormat('yyyy-MM-dd').format(DateTime.now());
+
+    Color statusColor;
+    switch (record.status) {
+      case AttendanceStatus.present: statusColor = _C.success; break;
+      case AttendanceStatus.late:    statusColor = _C.warning; break;
+      default:                       statusColor = _C.error;
+    }
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _C.card,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: isToday
+              ? _C.accent.withOpacity(0.4) : _C.white15,
+          width: isToday ? 1.5 : 0.5,
+        ),
+      ),
+      child: Row(children: [
+        Container(
+          width: 48,
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: isToday
+                ? _C.accent.withOpacity(0.1) : _C.white08,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Column(children: [
+            Text(
+              date != null ? DateFormat('EEE').format(date) : '',
+              style: TextStyle(
+                  fontSize: 9,
+                  color: isToday ? _C.accent : _C.white40,
+                  fontWeight: FontWeight.w600),
+            ),
+            Text(
+              date != null ? DateFormat('d').format(date) : '--',
+              style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                  color: isToday ? _C.accent : _C.white),
+            ),
+          ]),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: [
+                  _TimeChip(
+                      label: 'IN',
+                      time: fmt12(record.timeIn),
+                      color: _C.success),
+                  const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 6),
+                      child: Icon(Icons.arrow_forward_rounded,
+                          size: 11, color: _C.white40)),
+                  _TimeChip(
+                      label: 'OUT',
+                      time: record.timeOut != null
+                          ? fmt12(record.timeOut) : 'ACTIVE',
+                      color: record.timeOut != null
+                          ? _C.purple : _C.warning),
+                ]),
+                const SizedBox(height: 6),
+                Text(record.formattedWorkHours,
+                    style: TextStyle(fontSize: 11, color: _C.white40)),
+              ]),
+        ),
+        Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+          Container(
+            padding: const EdgeInsets.symmetric(
+                horizontal: 7, vertical: 3),
+            decoration: BoxDecoration(
+              color: statusColor.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(7),
+            ),
+            child: Text(
+              record.status.label.toUpperCase(),
+              style: TextStyle(
+                  fontSize: 8,
+                  color: statusColor,
+                  fontWeight: FontWeight.w800),
+            ),
+          ),
+        ]),
+      ]),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Shared helpers
+// ══════════════════════════════════════════════════════════════════════════════
+class _TimeChip extends StatelessWidget {
   final String label;
   final String time;
-  final String? fullStamp;
-  final Color color;
-  final IconData icon;
-  const _BigStampBlock({required this.label, required this.time,
-    this.fullStamp, required this.color, required this.icon});
+  final Color  color;
+  const _TimeChip(
+      {required this.label, required this.time, required this.color});
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(12),
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+    decoration: BoxDecoration(
+      color: color.withOpacity(0.1),
+      borderRadius: BorderRadius.circular(8),
+      border: Border.all(color: color.withOpacity(0.3)),
+    ),
+    child: Row(mainAxisSize: MainAxisSize.min, children: [
+      Text('$label ',
+          style: TextStyle(
+              fontSize: 8,
+              color: color,
+              fontWeight: FontWeight.w800)),
+      Text(time,
+          style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              color: color)),
+    ]),
+  );
+}
+
+class _StatChip extends StatelessWidget {
+  final String   label;
+  final String   value;
+  final Color    color;
+  final IconData icon;
+  const _StatChip(
+      {required this.label,
+        required this.value,
+        required this.color,
+        required this.icon});
+
+  @override
+  Widget build(BuildContext context) => Expanded(
+    child: Container(
+      padding:
+      const EdgeInsets.symmetric(vertical: 12, horizontal: 12),
       decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.08),
+        color: color.withOpacity(0.07),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: color.withValues(alpha: 0.25)),
+        border: Border.all(color: color.withOpacity(0.2)),
       ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          Icon(icon, color: color, size: 12),
-          const SizedBox(width: 4),
-          Text(label,
-              style: TextStyle(fontSize: 8, color: color,
-                  fontWeight: FontWeight.w800, letterSpacing: 0.5)),
-        ]),
-        const SizedBox(height: 6),
-        Text(time,
-            style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800,
-                color: color)),
-        if (fullStamp != null)
-          Padding(
-            padding: const EdgeInsets.only(top: 2),
-            child: Text(fullStamp!,
-                style: const TextStyle(fontSize: 9, color: AppColors.textMuted,
-                    fontFamily: 'monospace'),
-                overflow: TextOverflow.ellipsis),
-          ),
-      ]),
-    );
-  }
-}
-
-class _StampPill extends StatelessWidget {
-  final String label;
-  final String? time;
-  final Color color;
-  const _StampPill({required this.label, required this.time, required this.color});
-
-  @override
-  Widget build(BuildContext context) {
-    String display = '--:--';
-    if (time != null) {
-      try {
-        display = DateFormat('hh:mm a').format(DateFormat('HH:mm:ss').parse(time!));
-      } catch (_) { display = time!; }
-    }
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: time != null ? color.withValues(alpha: 0.1) : AppColors.surfaceLight,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(
-            color: time != null ? color.withValues(alpha: 0.3) : AppColors.cardBorder),
-      ),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Text('$label ',
-            style: TextStyle(fontSize: 8, color: color, fontWeight: FontWeight.w800)),
-        Text(display,
-            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
-                color: time != null ? color : AppColors.textMuted)),
-      ]),
-    );
-  }
-}
-
-class _MiniChip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final Color color;
-  const _MiniChip({required this.icon, required this.label, required this.color});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-          color: AppColors.surfaceLight,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: AppColors.cardBorder)),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Icon(icon, color: color, size: 11),
-        const SizedBox(width: 4),
-        Text(label,
-            style: TextStyle(fontSize: 10, color: color, fontWeight: FontWeight.w600)),
-      ]),
-    );
-  }
+      child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: color, size: 16),
+            const SizedBox(height: 6),
+            Text(value,
+                style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
+                    color: color)),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 9,
+                    color: color.withOpacity(0.7),
+                    fontWeight: FontWeight.w700)),
+          ]),
+    ),
+  );
 }

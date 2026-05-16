@@ -22,104 +22,66 @@ class MainScreen extends StatefulWidget {
 class MainScreenState extends State<MainScreen>
     with SingleTickerProviderStateMixin {
   int _currentIndex = 0;
-  bool _menuOpen = false;
-  late AnimationController _menuCtrl;
-  late Animation<double> _menuAnim;
 
   void switchTab(int index) {
-    if (mounted) {
-      debugPrint('Switching to tab index: $index');
-      setState(() {
-        _currentIndex = index;
-        _menuOpen = false;
-      });
-      _menuCtrl.reverse();
-    }
+    if (mounted) setState(() => _currentIndex = index);
   }
 
   @override
   void initState() {
     super.initState();
-    _menuCtrl = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 450),
-    );
-    _menuAnim = CurvedAnimation(
-      parent: _menuCtrl,
-      curve: Curves.easeOutBack,
-      reverseCurve: Curves.easeInCirc,
-    );
   }
 
   @override
   void dispose() {
-    _menuCtrl.dispose();
     super.dispose();
   }
 
-  void _toggleMenu() {
-    setState(() {
-      _menuOpen = !_menuOpen;
-      if (_menuOpen) {
-        _menuCtrl.forward();
-      } else {
-        _menuCtrl.reverse();
-      }
-    });
-  }
+  // ── Nav items — all use orange palette tones ───────────────────────────────
+  static const _navItems = [
+    _NavData(icon: Icons.dashboard_rounded,   label: 'Dashboard',  index: 0, color: Color(0xFFFF5500)),
+    _NavData(icon: Icons.fingerprint_rounded, label: 'Clock',      index: 1, color: Color(0xFFFF7A1A)),
+    _NavData(icon: Icons.history_rounded,     label: 'History',    index: 2, color: Color(0xFFFFAA00)),
+    _NavData(icon: Icons.people_rounded,      label: 'Employees',  index: 3, color: Color(0xFFFF3D00)),
+    _NavData(icon: Icons.bar_chart_rounded,   label: 'Reports',    index: 4, color: Color(0xFFFFCC44)),
+    _NavData(icon: Icons.person_rounded,      label: 'Profile',    index: 5, color: Color(0xFFFF8833)),
+  ];
 
   @override
   Widget build(BuildContext context) {
+    final isWeb = kIsWeb && MediaQuery.of(context).size.width >= 768;
+
     return Scaffold(
       backgroundColor: AppColors.primary,
       body: Row(
         children: [
-          if (kIsWeb) _buildWebSidebar(),
+          if (isWeb) _buildWebSidebar(),
           Expanded(
             child: Stack(
               children: [
-                // 1. Content Layer
-                IndexedStack(
-                  index: _currentIndex,
-                  children: [
-                    DashboardScreen(onTabSwitch: switchTab, initialEmployee: widget.employee),
-                    ClockScreen(initialEmployee: widget.employee),
-                    AttendanceHistoryScreen(initialEmployee: widget.employee),
-                    const EmployeesScreen(),
-                    ReportsScreen(initialEmployee: widget.employee),
-                    ProfileScreen(initialEmployee: widget.employee),
-                  ],
-                ),
-
-                // 2. Dimmer Layer (Mobile Only when menu is open)
-                if (!kIsWeb && _menuOpen)
-                  Positioned.fill(
-                    child: GestureDetector(
-                      onTap: _toggleMenu,
-                      behavior: HitTestBehavior.opaque,
-                      child: Container(color: Colors.black.withValues(alpha: 0.7)),
-                    ),
+                Positioned.fill(
+                  bottom: isWeb ? 0 : 70,
+                  child: IndexedStack(
+                    index: _currentIndex,
+                    children: [
+                      DashboardScreen(
+                          onTabSwitch: switchTab,
+                          initialEmployee: widget.employee),
+                      ClockScreen(initialEmployee: widget.employee),
+                      AttendanceHistoryScreen(
+                          initialEmployee: widget.employee),
+                      const EmployeesScreen(),
+                      ReportsScreen(initialEmployee: widget.employee),
+                      ProfileScreen(initialEmployee: widget.employee),
+                    ],
                   ),
-
-                // 3. Bottom Bar Background Layer (Mobile Only)
-                if (!kIsWeb)
+                ),
+                if (!isWeb)
                   Positioned(
                     left: 0,
                     right: 0,
                     bottom: 0,
-                    child: _buildBottomBarContainer(),
-                  ),
-
-                // 4. Radial Menu Items Layer (Mobile Only)
-                if (!kIsWeb) ..._buildRadialItems(),
-
-                // 5. Center FAB Layer (Mobile Only)
-                if (!kIsWeb)
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: MediaQuery.of(context).padding.bottom + 20,
-                    child: Center(child: _buildCenterButton()),
+                    child: _buildMobileBottomNav(),
                   ),
               ],
             ),
@@ -129,22 +91,29 @@ class MainScreenState extends State<MainScreen>
     );
   }
 
-  // ─── Web Sidebar ───────────────────────────────────────────────────────────
+  // ── Web Sidebar ──────────────────────────────────────────────────────────────
   Widget _buildWebSidebar() {
+    final w = MediaQuery.of(context).size.width;
+    final sidebarWidth = w >= 1200 ? 260.0 : 220.0;
+
     return Container(
-      width: 260,
+      width: sidebarWidth,
       decoration: BoxDecoration(
         color: AppColors.card,
-        border: Border(right: BorderSide(color: Colors.white.withValues(alpha: 0.05))),
+        border: Border(
+          right: BorderSide(
+              color: AppColors.orange.withOpacity(0.12), width: 1),
+        ),
       ),
       child: Column(
         children: [
           _buildWebLogo(),
-          const SizedBox(height: 20),
+          const SizedBox(height: 12),
           Expanded(
             child: ListView(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              children: _navItems.map((item) => _webNavItem(item)).toList(),
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              children:
+              _navItems.map((item) => _webNavItem(item)).toList(),
             ),
           ),
           _buildWebProfileFooter(),
@@ -155,45 +124,106 @@ class MainScreenState extends State<MainScreen>
 
   Widget _buildWebLogo() {
     return Container(
-      padding: const EdgeInsets.all(32),
+      padding: const EdgeInsets.fromLTRB(24, 28, 24, 20),
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(
+              color: AppColors.orange.withOpacity(0.12), width: 1),
+        ),
+      ),
       child: Row(
         children: [
           Container(
-            padding: const EdgeInsets.all(8),
+            width: 38,
+            height: 38,
             decoration: BoxDecoration(
               gradient: AppColors.gradientPrimary,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(4),
+              boxShadow: [
+                BoxShadow(
+                  color: AppColors.orange.withOpacity(0.35),
+                  blurRadius: 14,
+                )
+              ],
             ),
-            child: const Icon(Icons.fingerprint_rounded, color: Colors.white, size: 24),
+            child: const Icon(Icons.fingerprint_rounded,
+                color: Colors.white, size: 22),
           ),
           const SizedBox(width: 12),
-          const Text('HRIS BIO', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w900, letterSpacing: -0.5)),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('HRIS',
+                  style: TextStyle(
+                      color: AppColors.textPrimary,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 3)),
+              Text('BIOMETRICS',
+                  style: TextStyle(
+                      color: AppColors.orange,
+                      fontSize: 8,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 3)),
+            ],
+          ),
         ],
       ),
     );
   }
 
   Widget _webNavItem(_NavData item) {
-    bool active = _currentIndex == item.index;
+    final active = _currentIndex == item.index;
     return InkWell(
       onTap: () => switchTab(item.index),
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+      borderRadius: BorderRadius.circular(4),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        margin: const EdgeInsets.symmetric(vertical: 3),
+        padding:
+        const EdgeInsets.symmetric(vertical: 12, horizontal: 14),
         decoration: BoxDecoration(
-          color: active ? item.color.withValues(alpha: 0.1) : Colors.transparent,
-          borderRadius: BorderRadius.circular(12),
+          color: active
+              ? item.color.withOpacity(0.1)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(
+            color: active
+                ? item.color.withOpacity(0.3)
+                : Colors.transparent,
+          ),
         ),
         child: Row(
           children: [
-            Icon(item.icon, color: active ? item.color : Colors.white30, size: 20),
-            const SizedBox(width: 16),
-            Text(item.label, style: TextStyle(
-              color: active ? Colors.white : Colors.white60,
-              fontWeight: active ? FontWeight.bold : FontWeight.w500,
-              fontSize: 14
-            )),
+            Icon(item.icon,
+                color: active
+                    ? item.color
+                    : AppColors.textMuted,
+                size: 18),
+            const SizedBox(width: 14),
+            Text(
+              item.label.toUpperCase(),
+              style: TextStyle(
+                color: active
+                    ? AppColors.textPrimary
+                    : AppColors.textMuted,
+                fontWeight:
+                active ? FontWeight.w800 : FontWeight.w500,
+                fontSize: 11,
+                letterSpacing: 1.5,
+              ),
+            ),
+            if (active) ...[
+              const Spacer(),
+              Container(
+                width: 4,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: item.color,
+                  shape: BoxShape.circle,
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -203,237 +233,140 @@ class MainScreenState extends State<MainScreen>
   Widget _buildWebProfileFooter() {
     final emp = widget.employee;
     return Container(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        border: Border(top: BorderSide(color: Colors.white.withValues(alpha: 0.05))),
+        border: Border(
+          top: BorderSide(
+              color: AppColors.orange.withOpacity(0.12), width: 1),
+        ),
       ),
       child: Row(
         children: [
-          CircleAvatar(
-            backgroundColor: AppColors.accent, 
-            radius: 18, 
-            child: Text(emp?.initials ?? '?', style: const TextStyle(fontSize: 12, color: Colors.white))
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              gradient: AppColors.gradientPrimary,
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Center(
+              child: Text(
+                emp?.initials ?? '?',
+                style: const TextStyle(
+                    fontSize: 12,
+                    color: Colors.white,
+                    fontWeight: FontWeight.w800),
+              ),
+            ),
           ),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(emp?.fullName ?? 'Guest', style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
-                Text(emp?.position ?? 'User', style: const TextStyle(color: Colors.white30, fontSize: 11)),
+                Text(
+                  emp?.fullName ?? 'Guest',
+                  style: const TextStyle(
+                      color: AppColors.textPrimary,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700),
+                ),
+                Text(
+                  emp?.position ?? 'User',
+                  style: const TextStyle(
+                      color: AppColors.textMuted, fontSize: 11),
+                ),
               ],
             ),
           ),
-          IconButton(onPressed: () {}, icon: const Icon(Icons.logout_rounded, color: Colors.white24, size: 18)),
+          IconButton(
+            onPressed: () {},
+            icon: const Icon(Icons.logout_rounded,
+                color: AppColors.textMuted, size: 17),
+          ),
         ],
       ),
     );
   }
 
-  // ─── Nav Items Data ────────────────────────────────────────────────────────
-  static const _navItems = [
-    _NavData(icon: Icons.dashboard_rounded,   label: 'Dashboard', index: 0, color: Color(0xFF6C63FF)),
-    _NavData(icon: Icons.fingerprint_rounded, label: 'Clock In/Out', index: 1, color: Color(0xFF00D4AA)),
-    _NavData(icon: Icons.history_rounded,     label: 'History',   index: 2, color: Color(0xFF4FC3F7)),
-    _NavData(icon: Icons.people_rounded,      label: 'Employees', index: 3, color: Color(0xFF81C784)),
-    _NavData(icon: Icons.bar_chart_rounded,   label: 'Reports',   index: 4, color: Color(0xFFFFB74D)),
-    _NavData(icon: Icons.person_rounded,      label: 'Profile',   index: 5, color: Color(0xFFFF8A65)),
-  ];
-
-  Widget _buildBottomBarContainer() {
-    final current = _navItems[_currentIndex];
-    final bottomPadding = MediaQuery.of(context).padding.bottom;
-
+  // ── Mobile Bottom Nav ────────────────────────────────────────────────────────
+  Widget _buildMobileBottomNav() {
     return Container(
-      height: 70 + bottomPadding,
       decoration: BoxDecoration(
         color: AppColors.card,
-        border: const Border(
-          top: BorderSide(color: AppColors.cardBorder, width: 1),
+        border: Border(
+          top: BorderSide(
+              color: AppColors.orange.withOpacity(0.2), width: 1),
         ),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withValues(alpha: 0.4),
-            blurRadius: 20,
-            offset: const Offset(0, -4),
-          ),
+              color: Colors.black.withOpacity(0.5),
+              blurRadius: 24,
+              offset: const Offset(0, -4)),
         ],
       ),
       child: SafeArea(
         top: false,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24),
+        child: SizedBox(
+          height: 60,
           child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              // Left side label
-              Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    current.label,
-                    style: TextStyle(
-                      color: current.color,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                  const Text(
-                    'Current Page',
-                    style: TextStyle(color: AppColors.textMuted, fontSize: 10),
-                  ),
-                ],
-              ),
-
-              // Right side grid toggle
-              GestureDetector(
-                onTap: _toggleMenu,
-                behavior: HitTestBehavior.opaque,
-                child: Container(
-                  padding: const EdgeInsets.all(12),
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 300),
-                    child: Icon(
-                      _menuOpen ? Icons.close_rounded : Icons.grid_view_rounded,
-                      color: AppColors.textMuted,
-                      size: 24,
-                      key: ValueKey(_menuOpen),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildCenterButton() {
-    final current = _navItems[_currentIndex];
-    return GestureDetector(
-      onTap: _toggleMenu,
-      behavior: HitTestBehavior.opaque,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        width: 60,
-        height: 60,
-        decoration: BoxDecoration(
-          gradient: _menuOpen
-              ? const LinearGradient(colors: [Color(0xFFFF6B6B), Color(0xFFFF8E8E)])
-              : AppColors.gradientPrimary,
-          shape: BoxShape.circle,
-          boxShadow: [
-            BoxShadow(
-              color: (_menuOpen ? const Color(0xFFFF6B6B) : AppColors.accent).withValues(alpha: 0.4),
-              blurRadius: 15,
-              spreadRadius: 2,
-            ),
-          ],
-        ),
-        child: AnimatedRotation(
-          turns: _menuOpen ? 0.125 : 0,
-          duration: const Duration(milliseconds: 300),
-          child: Icon(
-            _menuOpen ? Icons.add : current.icon,
-            color: Colors.white,
-            size: 28,
-          ),
-        ),
-      ),
-    );
-  }
-
-  List<Widget> _buildRadialItems() {
-    // Relative coordinates for items when expanded (Positive Y is UP)
-    const arcPositions = [
-      Offset(-130, 30),   // Home
-      Offset(-90, 100),   // Clock
-      Offset(-30, 150),   // History
-      Offset(30, 150),    // Employees
-      Offset(90, 100),    // Reports
-      Offset(130, 30),    // Profile
-    ];
-
-    final bottomPadding = MediaQuery.of(context).padding.bottom;
-    final screenWidth = MediaQuery.of(context).size.width;
-
-    return _navItems.asMap().entries.map((entry) {
-      final i = entry.key;
-      final item = entry.value;
-      final isSelected = _currentIndex == item.index;
-
-      return AnimatedBuilder(
-        animation: _menuAnim,
-        builder: (context, child) {
-          final t = _menuAnim.value;
-          if (t == 0 && !_menuOpen) return const SizedBox.shrink();
-
-          final offset = arcPositions[i];
-
-          return Positioned(
-            // Start from the center of the FAB and move UP
-            bottom: bottomPadding + 50 + (offset.dy * t),
-            left: (screenWidth / 2) - 25 + (offset.dx * t),
-            child: Opacity(
-              opacity: t.clamp(0.0, 1.0),
-              child: GestureDetector(
-                onTap: () => switchTab(item.index),
-                behavior: HitTestBehavior.opaque,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (t > 0.8)
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                        margin: const EdgeInsets.only(bottom: 4),
+            children: _navItems.map((item) {
+              final active = _currentIndex == item.index;
+              return Expanded(
+                child: GestureDetector(
+                  onTap: () => switchTab(item.index),
+                  behavior: HitTestBehavior.opaque,
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      AnimatedContainer(
+                        duration: const Duration(milliseconds: 180),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 4),
                         decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.8),
-                          borderRadius: BorderRadius.circular(10),
+                          color: active
+                              ? item.color.withOpacity(0.12)
+                              : Colors.transparent,
+                          borderRadius: BorderRadius.circular(4),
                         ),
-                        child: Text(
-                          item.label,
-                          style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
+                        child: Icon(item.icon,
+                            color: active
+                                ? item.color
+                                : AppColors.textMuted,
+                            size: 19),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        item.label.toUpperCase(),
+                        style: TextStyle(
+                          color: active
+                              ? item.color
+                              : AppColors.textMuted,
+                          fontSize: 8,
+                          fontWeight: active
+                              ? FontWeight.w800
+                              : FontWeight.w500,
+                          letterSpacing: 0.8,
                         ),
+                        overflow: TextOverflow.ellipsis,
                       ),
-                    Container(
-                      width: 50,
-                      height: 50,
-                      decoration: BoxDecoration(
-                        color: isSelected ? item.color : AppColors.card,
-                        shape: BoxShape.circle,
-                        border: Border.all(color: item.color, width: 2),
-                        boxShadow: [
-                          BoxShadow(
-                            color: item.color.withValues(alpha: 0.4),
-                            blurRadius: 10,
-                            spreadRadius: 1,
-                          ),
-                        ],
-                      ),
-                      child: Icon(
-                        item.icon,
-                        color: isSelected ? Colors.white : item.color,
-                        size: 24,
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ),
-          );
-        },
-      );
-    }).toList();
+              );
+            }).toList(),
+          ),
+        ),
+      ),
+    );
   }
 }
 
 class _NavData {
   final IconData icon;
-  final String   label;
-  final int      index;
-  final Color    color;
+  final String label;
+  final int index;
+  final Color color;
 
   const _NavData({
     required this.icon,

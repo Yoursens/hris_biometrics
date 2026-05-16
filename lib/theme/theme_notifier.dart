@@ -10,9 +10,14 @@ class ThemeNotifier extends ChangeNotifier {
   bool get isDark => _isDark;
   ThemeMode get themeMode => _isDark ? ThemeMode.dark : ThemeMode.light;
 
-  Future<void> loadFromPrefs() async {
+  ThemeNotifier() {
+    _loadFromPrefs();
+  }
+
+  Future<void> _loadFromPrefs() async {
     final prefs = await SharedPreferences.getInstance();
     _isDark = prefs.getBool(_key) ?? true;
+    notifyListeners(); // ← notify after loading so UI updates
   }
 
   void toggle() {

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+  <!-- ─── Biometrics (Face ID / Touch ID) ─────────────────────────── -->
+  <key>NSFaceIDUsageDescription</key>
+  <string>This app uses Face ID for secure authentication.</string>
+
+  <!-- ─── Camera ───────────────────────────────────────────────────── -->
+  <key>NSCameraUsageDescription</key>
+  <string>This app uses the camera for face recognition attendance.</string>
+
+  <!-- ─── Location ─────────────────────────────────────────────────── -->
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>This app uses your location for geofencing attendance.</string>
+
+  <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+  <string>This app uses background location to verify attendance zones.</string>
+
+  <key>NSLocationAlwaysUsageDescription</key>
+  <string>This app needs background location access for geofencing.</string>
+
+  <!-- ─── NFC ───────────────────────────────────────────────────────── -->
+  <key>NFCReaderUsageDescription</key>
+  <string>This app uses NFC for card-based attendance scanning.</string>
+
+  <!-- ─── Background Modes ─────────────────────────────────────────── -->
+  <key>UIBackgroundModes</key>
+  <array>
+    <string>location</string>
+    <string>fetch</string>
+    <string>processing</string>
+  </array>
+
+  <!-- ─── Local Network (for XAMPP/local server) ───────────────────── -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>This app connects to a local server for syncing attendance data.</string>
+
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <!-- Only if your server uses HTTP (not HTTPS) -->
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+
+</dict>
+</plist>

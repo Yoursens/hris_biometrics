@@ -59,7 +59,7 @@ class _GeofenceStatusCardState extends State<GeofenceStatusCard>
     String statusLabel;
 
     if (isLoading) {
-      statusColor = AppColors.accentSecondary;
+      statusColor = AppColors.orange;
       statusIcon  = Icons.gps_fixed_rounded;
       statusLabel = 'Locating...';
     } else if (result == null) {
@@ -398,7 +398,7 @@ class GeofenceBlockedDialog extends StatelessWidget {
               decoration: BoxDecoration(
                   color: AppColors.surfaceLight, borderRadius: BorderRadius.circular(12)),
               child: Row(children: [
-                const Icon(Icons.business_rounded, color: AppColors.accentSecondary, size: 16),
+                const Icon(Icons.business_rounded, color: AppColors.orange, size: 16),
                 const SizedBox(width: 8),
                 Expanded(child: Text(GeofenceService.officeAddress,
                     style: const TextStyle(color: AppColors.textSecondary, fontSize: 12, height: 1.4))),

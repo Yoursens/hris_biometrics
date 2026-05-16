@@ -15,10 +15,9 @@ import '../models/attendance.dart';
 import '../models/employee.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Bootstrap design tokens  (mirrors admin_dashboard.dart BS class)
+// Bootstrap design tokens
 // ═══════════════════════════════════════════════════════════════════════════════
 class BS {
-  // ── Core palette ──────────────────────────────────────────────────────────
   static const Color primary   = Color(0xFF0D6EFD);
   static const Color secondary = Color(0xFF6C757D);
   static const Color success   = Color(0xFF198754);
@@ -29,33 +28,26 @@ class BS {
   static const Color dark      = Color(0xFF212529);
   static const Color white     = Color(0xFFFFFFFF);
   static const Color muted     = Color(0xFF6C757D);
-
-  // ── Dark nav surfaces ─────────────────────────────────────────────────────
   static const Color navBg     = Color(0xFF212529);
   static const Color navText   = Color(0xFFADB5BD);
   static const Color border    = Color(0xFFDEE2E6);
-
-  // ── Page / card surfaces ──────────────────────────────────────────────────
   static const Color darkBg    = Color(0xFF060D1F);
   static const Color darkSurf  = Color(0xFF0D1B2E);
   static const Color darkCard  = Color(0xFF0F2040);
   static const Color darkBorder= Color(0xFF1A3356);
 
-  // ── Spacing ($spacer = 16 px) ─────────────────────────────────────────────
   static const double s1 = 4;
   static const double s2 = 8;
   static const double s3 = 16;
   static const double s4 = 24;
   static const double s5 = 48;
 
-  // ── Border-radius ─────────────────────────────────────────────────────────
   static const double radiusSm   = 4;
   static const double radius     = 8;
   static const double radiusLg   = 12;
   static const double radiusXl   = 16;
   static const double radiusPill = 50;
 
-  // ── Type scale ────────────────────────────────────────────────────────────
   static const double textXs   = 10;
   static const double textSm   = 12;
   static const double textBase = 14;
@@ -63,24 +55,17 @@ class BS {
   static const double textXl   = 20;
   static const double text2xl  = 24;
 
-  // ── Dark card decoration ──────────────────────────────────────────────────
-  static BoxDecoration darkCardDeco({
-    double r = BS.radiusLg,
-    Color? borderColor,
-  }) =>
+  static BoxDecoration darkCardDeco({double r = BS.radiusLg, Color? borderColor}) =>
       BoxDecoration(
         color: darkCard,
         borderRadius: BorderRadius.circular(r),
         border: Border.all(color: borderColor ?? darkBorder),
         boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.25),
-            blurRadius: 12, offset: const Offset(0, 4),
-          ),
+          BoxShadow(color: Colors.black.withOpacity(0.25),
+              blurRadius: 12, offset: const Offset(0, 4)),
         ],
       );
 
-  // ── Badge / pill ──────────────────────────────────────────────────────────
   static Widget badge(String label, Color color) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
     decoration: BoxDecoration(
@@ -88,10 +73,8 @@ class BS {
       borderRadius: BorderRadius.circular(BS.radiusPill),
       border: Border.all(color: color.withOpacity(0.35)),
     ),
-    child: Text(label, style: TextStyle(
-      color: color, fontSize: BS.textXs,
-      fontWeight: FontWeight.w700, letterSpacing: 0.5,
-    )),
+    child: Text(label, style: TextStyle(color: color, fontSize: BS.textXs,
+        fontWeight: FontWeight.w700, letterSpacing: 0.5)),
   );
 }
 
@@ -105,8 +88,7 @@ class ClockScreen extends StatefulWidget {
   State<ClockScreen> createState() => _ClockScreenState();
 }
 
-class _ClockScreenState extends State<ClockScreen>
-    with TickerProviderStateMixin {
+class _ClockScreenState extends State<ClockScreen> with TickerProviderStateMixin {
   late AnimationController _pulseController;
   late AnimationController _successController;
   late AnimationController _ringController;
@@ -116,6 +98,12 @@ class _ClockScreenState extends State<ClockScreen>
 
   Employee?   _employee;
   Attendance? _lastRecord;
+
+  String? _webTimeIn;
+  String? _webTimeOut;
+  String? _webDate;
+  bool    _webClockedIn = false;
+
   bool   _loading           = true;
   bool   _processing        = false;
   bool   _showSuccess       = false;
@@ -127,19 +115,20 @@ class _ClockScreenState extends State<ClockScreen>
   late Timer _timer;
   DateTime _now = DateTime.now();
   final _uuid = const Uuid();
-  final TextEditingController _pinController = TextEditingController();
-  final ScrollController _scrollController  = ScrollController();
+  final TextEditingController _pinController    = TextEditingController();
+  final ScrollController       _scrollController = ScrollController();
+
+  StreamSubscription? _firestoreAttSub;
 
   late final List<_ClockMethod> _methods = [
     if (!kIsWeb)
-      _ClockMethod(icon: Icons.contactless_rounded,   label: 'NFC Tag',     color: BS.info,     type: AttendanceMethod.nfc),
-    _ClockMethod(icon: Icons.face_retouching_natural, label: 'Face ID',     color: BS.primary,  type: AttendanceMethod.face),
+      _ClockMethod(icon: Icons.contactless_rounded,   label: 'NFC Tag',     color: BS.info,      type: AttendanceMethod.nfc),
+    _ClockMethod(icon: Icons.face_retouching_natural, label: 'Face ID',     color: BS.primary,   type: AttendanceMethod.face),
     if (!kIsWeb)
-      _ClockMethod(icon: Icons.fingerprint_rounded,   label: 'Fingerprint', color: BS.secondary,type: AttendanceMethod.fingerprint),
-    _ClockMethod(icon: Icons.pin_rounded,             label: 'PIN',         color: BS.warning,  type: AttendanceMethod.pin),
+      _ClockMethod(icon: Icons.fingerprint_rounded,   label: 'Fingerprint', color: BS.secondary, type: AttendanceMethod.fingerprint),
+    _ClockMethod(icon: Icons.pin_rounded,             label: 'PIN',         color: BS.warning,   type: AttendanceMethod.pin),
   ];
 
-  // ── lifecycle ──────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
@@ -169,12 +158,112 @@ class _ClockScreenState extends State<ClockScreen>
     final empId = await SecurityService.instance.getCurrentEmployeeId();
     Employee?   emp;
     Attendance? att;
+
     if (empId != null && !kIsWeb) {
       emp = await DatabaseService.instance.getEmployeeById(empId);
       att = await DatabaseService.instance.getTodayAttendance(empId);
     }
+
     emp ??= widget.initialEmployee;
-    if (mounted) setState(() { _employee = emp; _lastRecord = att; _loading = false; });
+
+    if (kIsWeb && emp != null) {
+      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      try {
+        final inSnap = await FirebaseFirestore.instance
+            .collection('clock_ins')
+            .where('employee_id', isEqualTo: emp.employeeId)
+            .where('date', isEqualTo: today)
+            .orderBy('saved_at', descending: true)
+            .limit(1)
+            .get();
+
+        if (inSnap.docs.isNotEmpty) {
+          final inData = inSnap.docs.first.data();
+          final attendanceId = inData['attendance_id'];
+
+          final outSnap = await FirebaseFirestore.instance
+              .collection('clock_outs')
+              .where('attendance_id', isEqualTo: attendanceId)
+              .limit(1)
+              .get();
+
+          final rawIn  = inData['time_in']?.toString();
+          final rawOut = outSnap.docs.isNotEmpty
+              ? (outSnap.docs.first.data()['time_out']?.toString())
+              : null;
+
+          if (mounted) {
+            setState(() {
+              _webTimeIn    = rawIn;
+              _webTimeOut   = rawOut;
+              _webDate      = today;
+              _webClockedIn = rawOut == null;
+            });
+          }
+        } else {
+          final logSnap = await FirebaseFirestore.instance
+              .collection('attendance_logs')
+              .where('employee_id', isEqualTo: emp.employeeId)
+              .where('date', isEqualTo: today)
+              .orderBy('timestamp', descending: false)
+              .get();
+
+          if (logSnap.docs.isNotEmpty) {
+            String? lastIn;
+            String? lastOut;
+            for (final doc in logSnap.docs) {
+              final d = doc.data();
+              if (d['type'] == 'IN')  lastIn  = d['time']?.toString();
+              if (d['type'] == 'OUT') lastOut = d['time']?.toString();
+            }
+            final hasOut = lastOut != null;
+            if (mounted) {
+              setState(() {
+                _webTimeIn    = lastIn;
+                _webTimeOut   = lastOut;
+                _webDate      = today;
+                _webClockedIn = lastIn != null && !hasOut;
+              });
+            }
+          }
+        }
+      } catch (e) {
+        debugPrint('Firestore web load error: $e');
+      }
+
+      _firestoreAttSub?.cancel();
+      _firestoreAttSub = FirebaseFirestore.instance
+          .collection('attendance_logs')
+          .where('employee_id', isEqualTo: emp.employeeId)
+          .where('date', isEqualTo: today)
+          .orderBy('timestamp', descending: false)
+          .snapshots()
+          .listen((snap) {
+        if (!mounted) return;
+        String? lastIn;
+        String? lastOut;
+        for (final doc in snap.docs) {
+          final d = doc.data();
+          if (d['type'] == 'IN')  lastIn  = d['time']?.toString();
+          if (d['type'] == 'OUT') lastOut = d['time']?.toString();
+        }
+        final hasOut = lastOut != null;
+        setState(() {
+          _webTimeIn    = lastIn;
+          _webTimeOut   = lastOut;
+          _webDate      = today;
+          _webClockedIn = lastIn != null && !hasOut;
+        });
+      });
+    }
+
+    if (mounted) {
+      setState(() {
+        _employee   = emp;
+        _lastRecord = att;
+        _loading    = false;
+      });
+    }
   }
 
   Future<void> _checkGeofence() async {
@@ -182,9 +271,104 @@ class _ClockScreenState extends State<ClockScreen>
     if (mounted) setState(() => _geofenceResult = res);
   }
 
-  // ── Interaction Logic ──────────────────────────────────────────────────────
+  bool    get _isClockedIn     => kIsWeb ? _webClockedIn  : (_lastRecord?.isClockedIn ?? false);
+  String? get _displayTimeIn   => kIsWeb ? _webTimeIn     : _lastRecord?.timeIn;
+  String? get _displayTimeOut  => kIsWeb ? _webTimeOut    : _lastRecord?.timeOut;
+
+  bool get _isInsideZone {
+    if (_geofenceResult == null) return false;
+    return _geofenceResult!.isInside;
+  }
+
+  void _showGeofenceBlockDialog() {
+    final dist = _geofenceResult?.distanceMeters?.toStringAsFixed(0) ?? '?';
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: BS.darkCard,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(children: [
+          Container(
+            width: 36, height: 36,
+            decoration: BoxDecoration(
+              color: BS.danger.withOpacity(0.15),
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(Icons.location_off_rounded, color: BS.danger, size: 20),
+          ),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Text('Outside Work Zone',
+                style: TextStyle(color: Colors.white,
+                    fontWeight: FontWeight.w800, fontSize: 15)),
+          ),
+        ]),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: BS.danger.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: BS.danger.withOpacity(0.3)),
+            ),
+            child: Column(children: [
+              Icon(Icons.gps_off_rounded, color: BS.danger, size: 32),
+              const SizedBox(height: 10),
+              Text('You are ${dist}m away from the office perimeter.',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70,
+                      fontSize: 13, height: 1.5)),
+              const SizedBox(height: 8),
+              Text('You must be inside the work zone to clock in or clock out.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: BS.danger.withOpacity(0.9),
+                      fontSize: 12, fontWeight: FontWeight.w700, height: 1.4)),
+            ]),
+          ),
+        ]),
+        actions: [
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: BS.info.withOpacity(0.15),
+                foregroundColor: BS.info,
+                elevation: 0,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    side: BorderSide(color: BS.info.withOpacity(0.3))),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+              ),
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                _checkGeofence();
+              },
+              icon: const Icon(Icons.refresh_rounded, size: 16),
+              label: const Text('Retry Location Check',
+                  style: TextStyle(fontWeight: FontWeight.w700)),
+            ),
+          ),
+          const SizedBox(height: 4),
+          SizedBox(
+            width: double.infinity,
+            child: TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: Text('Dismiss',
+                  style: TextStyle(color: Colors.white38, fontSize: 13)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _handleClockTap() {
     if (_processing) return;
+    if (!_isInsideZone) {
+      _showGeofenceBlockDialog();
+      return;
+    }
     final type = _methods[_selectedMethod].type;
     if (type == AttendanceMethod.pin) {
       if (_pinController.text.length == 4) {
@@ -199,7 +383,6 @@ class _ClockScreenState extends State<ClockScreen>
     }
   }
 
-  // ── NFC Session ────────────────────────────────────────────────────────────
   Future<void> _startNfcSession() async {
     if (kIsWeb) return;
     try {
@@ -207,6 +390,10 @@ class _ClockScreenState extends State<ClockScreen>
       if (!isAvailable) return;
       NfcManager.instance.startSession(onDiscovered: (NfcTag tag) async {
         if (_processing || _showSuccess || (!kIsWeb && _selectedMethod != 0)) return;
+        if (!_isInsideZone) {
+          _showGeofenceBlockDialog();
+          return;
+        }
         final tagId = _extractTagId(tag);
         if (tagId == null) return;
         if (mounted) setState(() => _processing = true);
@@ -244,19 +431,136 @@ class _ClockScreenState extends State<ClockScreen>
 
   Future<void> _handlePinSubmit(String pin) async {
     if (_processing) return;
+    if (!_isInsideZone) {
+      _showGeofenceBlockDialog();
+      return;
+    }
     setState(() => _processing = true);
-    final empId = await SecurityService.instance.getCurrentEmployeeId();
-    if (empId == null) {
+
+    if (kIsWeb) {
+      try {
+        final emp = _employee ?? widget.initialEmployee;
+        if (emp == null) throw 'No employee session found.';
+
+        final snap1 = await FirebaseFirestore.instance
+            .collection('employees')
+            .where('status', isEqualTo: 'active')
+            .get();
+
+        DocumentSnapshot? matchedDoc;
+
+        for (final doc in snap1.docs) {
+          final data = doc.data() as Map<String, dynamic>;
+          final storedPin = data['tempPin']?.toString() ?? '';
+          if (storedPin != pin) continue;
+
+          final firestoreEmpId = (data['employeeId']
+              ?? data['employee_id']
+              ?? data['id']
+              ?? '').toString();
+          final sessionEmpId = (emp.employeeId.isNotEmpty
+              ? emp.employeeId : emp.id).toString();
+
+          if (firestoreEmpId == sessionEmpId ||
+              firestoreEmpId.toLowerCase() == sessionEmpId.toLowerCase()) {
+            matchedDoc = doc;
+            break;
+          }
+
+          final firestoreEmail = (data['email'] ?? '').toString().toLowerCase();
+          final sessionEmail   = (emp.email ?? '').toString().toLowerCase();
+          if (sessionEmail.isNotEmpty && firestoreEmail == sessionEmail) {
+            matchedDoc = doc;
+            break;
+          }
+        }
+
+        if (matchedDoc == null) {
+          final pinMatches = snap1.docs.where((doc) {
+            final data = doc.data() as Map<String, dynamic>;
+            return (data['tempPin']?.toString() ?? '') == pin;
+          }).toList();
+          if (pinMatches.length == 1) matchedDoc = pinMatches.first;
+        }
+
+        if (matchedDoc == null) throw 'Invalid PIN';
+
+        _pinController.clear();
+        await _recordAttendance(AttendanceMethod.pin);
+        return;
+      } catch (e) {
+        final msg = e.toString();
+        _showSnack(
+          msg.contains('Invalid PIN') ? 'Invalid PIN. Please try again.' : 'Error: $msg',
+          BS.danger,
+        );
+        _pinController.clear();
+        if (mounted) setState(() => _processing = false);
+        return;
+      }
+    }
+
+    final emp = _employee ?? widget.initialEmployee;
+    if (emp == null) {
       _showSnack('Session Error', BS.danger);
       setState(() => _processing = false);
       return;
     }
-    final isValid = await SecurityService.instance.verifyPin(empId, pin);
+
+    bool isValid = false;
+
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('employees')
+          .where('status', isEqualTo: 'active')
+          .get();
+
+      for (final doc in snap.docs) {
+        final data = doc.data();
+        final storedPin = data['tempPin']?.toString() ?? '';
+        if (storedPin != pin) continue;
+
+        final firestoreEmpId = (data['employeeId']
+            ?? data['employee_id'] ?? '').toString();
+        final sessionEmpId = (emp.employeeId.isNotEmpty
+            ? emp.employeeId : emp.id).toString();
+        final firestoreEmail = (data['email'] ?? '').toString().toLowerCase();
+        final sessionEmail   = (emp.email ?? '').toString().toLowerCase();
+
+        if (firestoreEmpId == sessionEmpId ||
+            firestoreEmpId.toLowerCase() == sessionEmpId.toLowerCase() ||
+            (sessionEmail.isNotEmpty && firestoreEmail == sessionEmail)) {
+          isValid = true;
+          break;
+        }
+      }
+
+      if (!isValid) {
+        final pinMatches = snap.docs.where((doc) {
+          return (doc.data()['tempPin']?.toString() ?? '') == pin;
+        }).toList();
+        if (pinMatches.length == 1) isValid = true;
+      }
+    } catch (e) {
+      debugPrint('Firestore PIN check error: $e');
+    }
+
+    if (!isValid) {
+      try {
+        final empId = await SecurityService.instance.getCurrentEmployeeId();
+        if (empId != null) {
+          isValid = await SecurityService.instance.verifyPin(empId, pin);
+        }
+      } catch (e) {
+        debugPrint('Local PIN check error: $e');
+      }
+    }
+
     if (isValid) {
       _pinController.clear();
       await _recordAttendance(AttendanceMethod.pin);
     } else {
-      _showSnack('Invalid PIN', BS.danger);
+      _showSnack('Invalid PIN. Please try again.', BS.danger);
       _pinController.clear();
       setState(() => _processing = false);
     }
@@ -270,26 +574,60 @@ class _ClockScreenState extends State<ClockScreen>
     final now     = DateTime.now();
     final today   = DateFormat('yyyy-MM-dd').format(now);
     final timeStr = DateFormat('HH:mm:ss').format(now);
-    final emp     = targetEmployee ?? _employee;
+    final emp     = targetEmployee ?? _employee ?? widget.initialEmployee;
     if (emp == null) return;
-    final record      = targetRecord ?? _lastRecord;
-    final isClockedIn = record?.isClockedIn ?? false;
+
+    final isClockedIn = kIsWeb ? _webClockedIn
+        : (targetRecord?.isClockedIn ?? _lastRecord?.isClockedIn ?? false);
+    final record = targetRecord ?? _lastRecord;
+
     try {
       if (kIsWeb) {
-        await FirebaseFirestore.instance.collection('attendance_logs').add({
-          'employee_id'  : emp.employeeId,
-          'employee_name': emp.fullName,
-          'date'         : today,
-          'time'         : timeStr,
-          'type'         : isClockedIn ? 'OUT' : 'IN',
-          'method'       : method.name,
-          'platform'     : 'Web',
-          'timestamp'    : FieldValue.serverTimestamp(),
-        });
-        _showSuccessOverlay(
-          isClockedIn ? 'Clock Out Success' : 'Clock In Success',
-          '${emp.fullName}\nTime: ${DateFormat('hh:mm a').format(now)}\n(Logged to Cloud)',
-        );
+        if (isClockedIn) {
+          await FirebaseFirestore.instance.collection('attendance_logs').add({
+            'employee_id'  : emp.employeeId,
+            'employee_name': emp.fullName,
+            'date'         : today,
+            'time'         : timeStr,
+            'type'         : 'OUT',
+            'method'       : method.name,
+            'platform'     : 'Web',
+            'timestamp'    : FieldValue.serverTimestamp(),
+          });
+          if (mounted) {
+            setState(() {
+              _webTimeOut   = timeStr;
+              _webClockedIn = false;
+            });
+          }
+          _showSuccessOverlay(
+            'Clock Out Success',
+            '${emp.fullName}\nTime: ${DateFormat('hh:mm a').format(now)}\n(Logged to Cloud)',
+          );
+        } else {
+          await FirebaseFirestore.instance.collection('attendance_logs').add({
+            'employee_id'  : emp.employeeId,
+            'employee_name': emp.fullName,
+            'date'         : today,
+            'time'         : timeStr,
+            'type'         : 'IN',
+            'method'       : method.name,
+            'platform'     : 'Web',
+            'timestamp'    : FieldValue.serverTimestamp(),
+          });
+          if (mounted) {
+            setState(() {
+              _webTimeIn    = timeStr;
+              _webTimeOut   = null;
+              _webDate      = today;
+              _webClockedIn = true;
+            });
+          }
+          _showSuccessOverlay(
+            'Clock In Success',
+            '${emp.fullName}\nTime: ${DateFormat('hh:mm a').format(now)}\n(Logged to Cloud)',
+          );
+        }
       } else {
         if (isClockedIn && record != null) {
           await DatabaseService.instance.updateTimeOut(record.id, timeStr);
@@ -314,8 +652,8 @@ class _ClockScreenState extends State<ClockScreen>
                 '${isLate ? "\n⚠ Late Arrival" : ""}',
           );
         }
+        await _loadData();
       }
-      await _loadData();
     } catch (e) {
       _showSnack('Record failed: $e', BS.danger);
     } finally {
@@ -376,6 +714,7 @@ class _ClockScreenState extends State<ClockScreen>
     _ringController.dispose();
     _pinController.dispose();
     _scrollController.dispose();
+    _firestoreAttSub?.cancel();
     if (!kIsWeb) NfcManager.instance.stopSession();
     super.dispose();
   }
@@ -392,12 +731,12 @@ class _ClockScreenState extends State<ClockScreen>
       body: Stack(children: [
         SafeArea(
           child: LayoutBuilder(builder: (ctx, constraints) {
-            final isWide = constraints.maxWidth >= 768; // Bootstrap md breakpoint
+            final isWide = constraints.maxWidth >= 768;
             return Center(
               child: ConstrainedBox(
                 constraints: BoxConstraints(maxWidth: isWide ? 960 : double.infinity),
                 child: Column(children: [
-                  _buildNavbar(),
+                  _buildNavbar(isWide: isWide),
                   Expanded(
                     child: Container(
                       color: BS.darkBg,
@@ -414,87 +753,163 @@ class _ClockScreenState extends State<ClockScreen>
     );
   }
 
-  // ── Navbar (.navbar .navbar-dark .bg-dark) ─────────────────────────────────
-  Widget _buildNavbar() {
+  // ── Navbar ─────────────────────────────────────────────────────────────────
+  Widget _buildNavbar({required bool isWide}) {
     final emp = _employee;
-    return Container(
-      height: 56,
-      color: BS.navBg,
-      padding: const EdgeInsets.symmetric(horizontal: BS.s3),
-      child: Row(children: [
-        // .navbar-brand
-        Row(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 28, height: 28,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(BS.radiusSm),
-              gradient: const LinearGradient(
-                colors: [BS.info, BS.primary],
-                begin: Alignment.topLeft, end: Alignment.bottomRight,
-              ),
-            ),
-            child: const Icon(Icons.fingerprint, color: BS.white, size: 16),
-          ),
-          const SizedBox(width: BS.s2),
-          RichText(text: const TextSpan(
-            style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800),
-            children: [
-              TextSpan(text: 'HRIS', style: TextStyle(color: BS.white)),
-              TextSpan(text: ' BIO',
-                  style: TextStyle(color: BS.info, fontWeight: FontWeight.w400)),
-            ],
-          )),
-        ]),
-        const Spacer(),
-        // Date badge → .badge .rounded-pill .border
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: BS.s2, vertical: 4),
-          decoration: BoxDecoration(
-            color: BS.info.withOpacity(0.12),
-            borderRadius: BorderRadius.circular(BS.radiusPill),
-            border: Border.all(color: BS.info.withOpacity(0.3)),
-          ),
-          child: Text(
-            DateFormat('EEE, MMM d').format(_now).toUpperCase(),
-            style: const TextStyle(color: BS.info, fontSize: BS.textXs,
-                fontWeight: FontWeight.w700, letterSpacing: 0.8),
+
+    // ── Logo ───────────────────────────────────────────────────────────────
+    final logo = Row(mainAxisSize: MainAxisSize.min, children: [
+      Container(
+        width: 26, height: 26,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(BS.radiusSm),
+          gradient: const LinearGradient(
+            colors: [BS.info, BS.primary],
+            begin: Alignment.topLeft, end: Alignment.bottomRight,
           ),
         ),
-        const SizedBox(width: BS.s3),
-        // Live clock — monospace matches Bootstrap code elements
-        Text(DateFormat('hh:mm a').format(_now),
-            style: const TextStyle(color: BS.info, fontWeight: FontWeight.w800,
-                fontSize: 14, fontFamily: 'monospace')),
-        const SizedBox(width: BS.s3),
-        // Employee name + avatar
-        if (emp != null) ...[
-          Column(crossAxisAlignment: CrossAxisAlignment.end,
-              mainAxisAlignment: MainAxisAlignment.center, children: [
-                Text(_greeting(), style: const TextStyle(
-                    color: BS.navText, fontSize: 9, letterSpacing: 0.5)),
-                Text(emp.fullName.split(' ').first.toUpperCase(),
-                    style: const TextStyle(color: BS.white,
-                        fontWeight: FontWeight.w700, fontSize: 11)),
-              ]),
-          const SizedBox(width: BS.s2),
-          CircleAvatar(
-            radius: 17,
-            backgroundColor: BS.primary,
-            child: Text(
-              emp.fullName.isNotEmpty ? emp.fullName[0].toUpperCase() : '?',
-              style: const TextStyle(color: BS.white,
-                  fontWeight: FontWeight.w800, fontSize: 13),
-            ),
-          ),
+        child: const Icon(Icons.fingerprint, color: BS.white, size: 15),
+      ),
+      const SizedBox(width: 6),
+      RichText(text: const TextSpan(
+        style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+        children: [
+          TextSpan(text: 'HRIS', style: TextStyle(color: BS.white)),
+          TextSpan(text: ' BIO',
+              style: TextStyle(color: BS.info, fontWeight: FontWeight.w400)),
         ],
-      ]),
+      )),
+    ]);
+
+    // ── Date pill ──────────────────────────────────────────────────────────
+    final datePill = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: BS.info.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(BS.radiusPill),
+        border: Border.all(color: BS.info.withOpacity(0.3)),
+      ),
+      child: Text(
+        DateFormat('EEE, MMM d').format(_now).toUpperCase(),
+        style: const TextStyle(color: BS.info, fontSize: 9,
+            fontWeight: FontWeight.w700, letterSpacing: 0.6),
+      ),
     );
+
+    // ── Clock ──────────────────────────────────────────────────────────────
+    final clock = Text(
+      DateFormat('hh:mm a').format(_now),
+      style: const TextStyle(color: BS.info, fontWeight: FontWeight.w800,
+          fontSize: 12, fontFamily: 'monospace'),
+    );
+
+    // ── Avatar circle only (no text on narrow) ─────────────────────────────
+    Widget? avatarOnly;
+    Widget? avatarWithName;
+    if (emp != null) {
+      final initial = emp.fullName.isNotEmpty
+          ? emp.fullName[0].toUpperCase() : '?';
+      final firstName = emp.fullName.split(' ').first.toUpperCase();
+
+      avatarOnly = CircleAvatar(
+        radius: 15,
+        backgroundColor: BS.primary,
+        child: Text(initial,
+            style: const TextStyle(color: BS.white,
+                fontWeight: FontWeight.w800, fontSize: 12)),
+      );
+
+      avatarWithName = Row(mainAxisSize: MainAxisSize.min, children: [
+        Column(crossAxisAlignment: CrossAxisAlignment.end,
+            mainAxisAlignment: MainAxisAlignment.center, children: [
+              Text(_greeting(),
+                  style: const TextStyle(
+                      color: BS.navText, fontSize: 9, letterSpacing: 0.4)),
+              Text(firstName,
+                  style: const TextStyle(color: BS.white,
+                      fontWeight: FontWeight.w700, fontSize: 11),
+                  overflow: TextOverflow.ellipsis,
+                  maxLines: 1),
+            ]),
+        const SizedBox(width: 6),
+        avatarOnly,
+      ]);
+    }
+
+    // ── Wide: single row ───────────────────────────────────────────────────
+    if (isWide) {
+      return Container(
+        height: 56, color: BS.navBg,
+        padding: const EdgeInsets.symmetric(horizontal: BS.s3),
+        child: Row(children: [
+          logo,
+          const Spacer(),
+          datePill,
+          const SizedBox(width: BS.s3),
+          clock,
+          if (avatarWithName != null) ...[
+            const SizedBox(width: BS.s3),
+            avatarWithName,
+          ],
+        ]),
+      );
+    }
+
+    // ── Narrow: use LayoutBuilder so we respond to the ACTUAL pixel width ──
+    // Layout:
+    //   Row 1  →  logo · · · · · · · datePill · clock · avatar
+    //   (greeting + name are hidden on narrow to save space)
+    return LayoutBuilder(builder: (_, constraints) {
+      // If even the single-row compact version fits, use it.
+      // Otherwise stack into two rows.
+      final singleRowFits = constraints.maxWidth >= 400;
+
+      if (singleRowFits) {
+        return Container(
+          color: BS.navBg,
+          padding: const EdgeInsets.symmetric(
+              horizontal: BS.s3, vertical: 10),
+          child: Row(children: [
+            logo,
+            const Spacer(),
+            datePill,
+            const SizedBox(width: BS.s2),
+            clock,
+            if (avatarOnly != null) ...[
+              const SizedBox(width: BS.s2),
+              avatarOnly,
+            ],
+          ]),
+        );
+      }
+
+      // Very narrow (< 400 px): two rows
+      return Container(
+        color: BS.navBg,
+        padding: const EdgeInsets.symmetric(
+            horizontal: BS.s3, vertical: 6),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // Row 1: logo + avatar
+          Row(children: [
+            logo,
+            const Spacer(),
+            if (avatarOnly != null) avatarOnly,
+          ]),
+          const SizedBox(height: 4),
+          // Row 2: date + clock centred
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            datePill,
+            const SizedBox(width: BS.s2),
+            clock,
+          ]),
+        ]),
+      );
+    });
   }
 
-  // ── Wide layout ≥ 768 px ──────────────────────────────────────────────────
+  // ── Wide layout ─────────────────────────────────────────────────────────────
   Widget _buildWideLayout() {
     return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      // col-5
       Expanded(
         flex: 5,
         child: SingleChildScrollView(
@@ -509,7 +924,6 @@ class _ClockScreenState extends State<ClockScreen>
         ),
       ),
       Container(width: 1, color: BS.darkBorder.withOpacity(0.5)),
-      // col-7
       Expanded(
         flex: 7,
         child: SingleChildScrollView(
@@ -524,7 +938,7 @@ class _ClockScreenState extends State<ClockScreen>
     ]);
   }
 
-  // ── Narrow layout < 768 px ─────────────────────────────────────────────────
+  // ── Narrow layout ───────────────────────────────────────────────────────────
   Widget _buildNarrowLayout() {
     return SingleChildScrollView(
       controller: _scrollController,
@@ -543,11 +957,10 @@ class _ClockScreenState extends State<ClockScreen>
     );
   }
 
-  // ── Geofence card ──────────────────────────────────────────────────────────
+  // ── Geofence card ───────────────────────────────────────────────────────────
   Widget _buildGeofenceCard() {
     return Container(
-      padding: const EdgeInsets.symmetric(
-          horizontal: BS.s3, vertical: BS.s2 + 2),
+      padding: const EdgeInsets.symmetric(horizontal: BS.s3, vertical: BS.s2 + 2),
       decoration: BS.darkCardDeco(r: BS.radius),
       child: Row(children: [
         Container(
@@ -566,18 +979,21 @@ class _ClockScreenState extends State<ClockScreen>
     );
   }
 
-  // ── Session card (.card .bg-dark) ─────────────────────────────────────────
+  // ── Session card ────────────────────────────────────────────────────────────
   Widget _buildSessionCard() {
-    final clocked = _lastRecord?.isClockedIn ?? false;
-    final timeIn  = _lastRecord?.timeIn;
-    final timeOut = _lastRecord?.timeOut;
+    final clocked  = _isClockedIn;
+    final timeIn   = _displayTimeIn;
+    final timeOut  = _displayTimeOut;
 
     String elapsed = '--';
     if (clocked && timeIn != null) {
       try {
-        final start = DateTime.parse('${_lastRecord!.date} $timeIn');
+        final dateStr = kIsWeb
+            ? (_webDate ?? DateFormat('yyyy-MM-dd').format(_now))
+            : (_lastRecord?.date ?? DateFormat('yyyy-MM-dd').format(_now));
+        final start = DateTime.parse('$dateStr $timeIn');
         final diff  = _now.difference(start);
-        elapsed     = '${diff.inHours}h ${diff.inMinutes % 60}m ${diff.inSeconds % 60}s';
+        elapsed = '${diff.inHours}h ${diff.inMinutes % 60}m ${diff.inSeconds % 60}s';
       } catch (_) {}
     }
 
@@ -587,13 +1003,12 @@ class _ClockScreenState extends State<ClockScreen>
         borderColor: clocked ? BS.success.withOpacity(0.35) : BS.darkBorder,
       ),
       child: Column(children: [
-        // .card-header
         Padding(
           padding: const EdgeInsets.fromLTRB(BS.s3, BS.s3, BS.s3, 0),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('TODAY', style: const TextStyle(
+              const Text('TODAY', style: TextStyle(
                 color: BS.navText, fontSize: BS.textXs,
                 fontWeight: FontWeight.w700, letterSpacing: 1.5,
               )),
@@ -605,7 +1020,6 @@ class _ClockScreenState extends State<ClockScreen>
           ),
         ),
         const Divider(color: BS.darkBorder, height: 24),
-        // .row .g-0 — three cells
         Padding(
           padding: const EdgeInsets.only(bottom: BS.s3),
           child: Row(children: [
@@ -645,10 +1059,11 @@ class _ClockScreenState extends State<ClockScreen>
     );
   }
 
-  // ── Clock ring (.btn-lg .rounded-circle) ───────────────────────────────────
+  // ── Clock ring ──────────────────────────────────────────────────────────────
   Widget _buildClockRing() {
-    final clocked   = _lastRecord?.isClockedIn ?? false;
-    final ringColor = clocked ? BS.danger : BS.primary;
+    final clocked    = _isClockedIn;
+    final blocked    = !_isInsideZone;
+    final ringColor  = blocked ? BS.secondary : (clocked ? BS.danger : BS.primary);
 
     return Center(
       child: AnimatedBuilder(
@@ -657,27 +1072,22 @@ class _ClockScreenState extends State<ClockScreen>
           return Transform.scale(
             scale: _pulseAnim.value,
             child: Stack(alignment: Alignment.center, children: [
-              // outer glow ring
               Container(
                 width: 216, height: 216,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  border: Border.all(
-                      color: ringColor.withOpacity(0.12), width: 1),
+                  border: Border.all(color: ringColor.withOpacity(0.12), width: 1),
                 ),
               ),
-              // spinning arc
               SizedBox(
                 width: 200, height: 200,
                 child: CircularProgressIndicator(
                   value: _ringAnim.value,
                   strokeWidth: 2,
                   backgroundColor: ringColor.withOpacity(0.07),
-                  valueColor: AlwaysStoppedAnimation(
-                      ringColor.withOpacity(0.35)),
+                  valueColor: AlwaysStoppedAnimation(ringColor.withOpacity(0.35)),
                 ),
               ),
-              // main button
               GestureDetector(
                 onTap: _handleClockTap,
                 child: Container(
@@ -685,13 +1095,10 @@ class _ClockScreenState extends State<ClockScreen>
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
                     color: BS.darkCard,
-                    border: Border.all(
-                        color: ringColor.withOpacity(0.5), width: 2),
+                    border: Border.all(color: ringColor.withOpacity(0.5), width: 2),
                     boxShadow: [
-                      BoxShadow(
-                        color: ringColor.withOpacity(0.22),
-                        blurRadius: 32, spreadRadius: 4,
-                      ),
+                      BoxShadow(color: ringColor.withOpacity(0.22),
+                          blurRadius: 32, spreadRadius: 4),
                     ],
                   ),
                   child: _processing
@@ -701,24 +1108,26 @@ class _ClockScreenState extends State<ClockScreen>
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         Icon(
-                          clocked ? Icons.logout_rounded
-                              : Icons.fingerprint_rounded,
+                          blocked
+                              ? Icons.location_off_rounded
+                              : (clocked ? Icons.logout_rounded : Icons.fingerprint_rounded),
                           size: 46, color: ringColor,
                         ),
                         const SizedBox(height: BS.s2),
                         Text(
-                          clocked ? 'CLOCK OUT' : 'CLOCK IN',
+                          blocked ? 'OUTSIDE ZONE'
+                              : (clocked ? 'CLOCK OUT' : 'CLOCK IN'),
                           style: TextStyle(
                             color: ringColor, fontSize: 11,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 2,
+                            fontWeight: FontWeight.w800, letterSpacing: 2,
                           ),
                         ),
                         const SizedBox(height: 3),
-                        const Text('TAP TO RECORD',
-                            style: TextStyle(
-                                color: BS.navText,
-                                fontSize: 9, letterSpacing: 1)),
+                        Text(
+                          blocked ? 'NOT ALLOWED' : 'TAP TO RECORD',
+                          style: const TextStyle(
+                              color: BS.navText, fontSize: 9, letterSpacing: 1),
+                        ),
                       ]),
                 ),
               ),
@@ -729,7 +1138,7 @@ class _ClockScreenState extends State<ClockScreen>
     );
   }
 
-  // ── Method selector (.btn-group feel) ─────────────────────────────────────
+  // ── Method selector ─────────────────────────────────────────────────────────
   Widget _buildMethodSelector() {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const Padding(
@@ -765,12 +1174,10 @@ class _ClockScreenState extends State<ClockScreen>
                   Container(
                     width: 36, height: 36,
                     decoration: BoxDecoration(
-                      color: active
-                          ? m.color.withOpacity(0.18) : BS.darkSurf,
+                      color: active ? m.color.withOpacity(0.18) : BS.darkSurf,
                       borderRadius: BorderRadius.circular(BS.radius),
                     ),
-                    child: Icon(m.icon,
-                        color: active ? m.color : BS.navText, size: 18),
+                    child: Icon(m.icon, color: active ? m.color : BS.navText, size: 18),
                   ),
                   const SizedBox(height: BS.s1 + 2),
                   Text(m.label, style: TextStyle(
@@ -787,7 +1194,7 @@ class _ClockScreenState extends State<ClockScreen>
     ]);
   }
 
-  // ── Method content ─────────────────────────────────────────────────────────
+  // ── Method content ──────────────────────────────────────────────────────────
   Widget _buildMethodContent() {
     final m = _methods[_selectedMethod];
     if (m.type == AttendanceMethod.pin) return _buildPinInput();
@@ -798,8 +1205,7 @@ class _ClockScreenState extends State<ClockScreen>
 
     return Container(
       padding: const EdgeInsets.all(BS.s4),
-      decoration: BS.darkCardDeco(
-          r: BS.radiusLg, borderColor: m.color.withOpacity(0.2)),
+      decoration: BS.darkCardDeco(r: BS.radiusLg, borderColor: m.color.withOpacity(0.2)),
       child: Column(children: [
         Container(
           width: 60, height: 60,
@@ -820,15 +1226,12 @@ class _ClockScreenState extends State<ClockScreen>
     );
   }
 
-  // ── PIN input (.form-control + .btn-warning .btn-lg .w-100) ───────────────
+  // ── PIN input ───────────────────────────────────────────────────────────────
   Widget _buildPinInput() {
     return Container(
       padding: const EdgeInsets.all(BS.s4),
-      decoration: BS.darkCardDeco(
-          r: BS.radiusLg,
-          borderColor: BS.warning.withOpacity(0.25)),
+      decoration: BS.darkCardDeco(r: BS.radiusLg, borderColor: BS.warning.withOpacity(0.25)),
       child: Column(children: [
-        // .card-header row
         Row(children: [
           Container(
             width: 36, height: 36,
@@ -848,7 +1251,6 @@ class _ClockScreenState extends State<ClockScreen>
           ]),
         ]),
         const SizedBox(height: BS.s3),
-        // .form-control (dark variant)
         TextField(
           controller: _pinController,
           obscureText: true,
@@ -883,7 +1285,6 @@ class _ClockScreenState extends State<ClockScreen>
           },
         ),
         const SizedBox(height: BS.s3),
-        // .btn .btn-warning .btn-lg .w-100
         SizedBox(
           width: double.infinity,
           child: ElevatedButton.icon(
@@ -905,8 +1306,7 @@ class _ClockScreenState extends State<ClockScreen>
             },
             icon: _processing
                 ? const SizedBox(width: 16, height: 16,
-                child: CircularProgressIndicator(
-                    color: BS.dark, strokeWidth: 2))
+                child: CircularProgressIndicator(color: BS.dark, strokeWidth: 2))
                 : const Icon(Icons.lock_open_rounded, size: 16),
             label: Text(
               _processing ? 'Verifying…' : 'Submit PIN',
@@ -919,7 +1319,7 @@ class _ClockScreenState extends State<ClockScreen>
     );
   }
 
-  // ── Success overlay (.modal .modal-dialog-centered) ────────────────────────
+  // ── Success overlay ─────────────────────────────────────────────────────────
   Widget _buildSuccessOverlay() {
     return Positioned.fill(
       child: Container(
@@ -929,8 +1329,7 @@ class _ClockScreenState extends State<ClockScreen>
             scale: _successAnim,
             child: Container(
               margin: const EdgeInsets.all(BS.s4),
-              padding: const EdgeInsets.symmetric(
-                  horizontal: BS.s4, vertical: 36),
+              padding: const EdgeInsets.symmetric(horizontal: BS.s4, vertical: 36),
               constraints: const BoxConstraints(maxWidth: 400),
               decoration: BS.darkCardDeco(
                 r: BS.radiusXl + 4,
@@ -958,8 +1357,7 @@ class _ClockScreenState extends State<ClockScreen>
                 Text(_successSubMessage,
                     textAlign: TextAlign.center,
                     style: const TextStyle(
-                        color: BS.navText, height: 1.7,
-                        fontSize: BS.textBase)),
+                        color: BS.navText, height: 1.7, fontSize: BS.textBase)),
               ]),
             ),
           ),
@@ -968,7 +1366,7 @@ class _ClockScreenState extends State<ClockScreen>
     );
   }
 
-  // ── Splash ─────────────────────────────────────────────────────────────────
+  // ── Splash ──────────────────────────────────────────────────────────────────
   Widget _splash() => Scaffold(
     backgroundColor: BS.navBg,
     body: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -1010,7 +1408,7 @@ class _ClockScreenState extends State<ClockScreen>
     ])),
   );
 
-  // ── Utilities ──────────────────────────────────────────────────────────────
+  // ── Utilities ────────────────────────────────────────────────────────────────
   String _fmt12(String t) {
     try { return DateFormat('hh:mm a').format(DateFormat('HH:mm:ss').parse(t)); }
     catch (_) { return t; }
